@@ -1,0 +1,20 @@
+{
+  "backbone": "ckpt3/last.pt",
+  "sel_acc_per_epoch": [
+    0.8850608850608851,
+    0.9114939114939115,
+    0.9168399168399168
+  ],
+  "best_sel_acc": 0.9171369171369171,
+  "best_step": 5400,
+  "val_acc": 0.856651376146789,
+  "val_loss": 0.46865720195429666,
+  "val_n": 872,
+  "val_se": 0.01186699009881095,
+  "epochs": 3,
+  "lr": 3e-05,
+  "llrd": 1.0,
+  "batch": 32,
+  "checkpoint": "ckpt_sst2_v3/best.pt",
+  "complete": true
+}

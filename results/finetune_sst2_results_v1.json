@@ -1,0 +1,14 @@
+{
+  "backbone": "ckpt2/last.pt",
+  "val_acc_per_epoch": [
+    0.8211009174311926,
+    0.8463302752293578,
+    0.8474770642201835
+  ],
+  "best_val_acc": 0.8474770642201835,
+  "epochs_done": 3,
+  "epochs": 3,
+  "lr": 2e-05,
+  "batch": 32,
+  "complete": true
+}

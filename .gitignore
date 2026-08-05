@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments / secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editors / tooling
+.vscode/
+.claude/
+
+# Large training artifacts -----------------------------------------------
+# Model weights: ~110-345 MB each, 9 of them.
+*.pt
+# Packed token memmaps (~6 GB) and their raw parquet downloads. The leading slash
+# anchors these to the repo root -- an unanchored `data/` also matches
+# mini_enc_transformer/data/ and would silently drop the package's data layer.
+/data/
+*.bin
+# HF datasets materialised on disk.
+/datasets/
+# Run logs and the pre-refactor code snapshot.
+/logs/
+
+# checkpoints/ is NOT ignored wholesale: the *.pt rule above drops the weights
+# while keeping each run's metrics.jsonl, which is the training history and only
+# a few hundred KB.
