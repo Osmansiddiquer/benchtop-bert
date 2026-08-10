@@ -1,0 +1,20 @@
+{
+  "backbone": "checkpoints/ckpt_jepa_imdb/last.pt",
+  "sel_acc_per_epoch": [
+    0.8699138699138699,
+    0.9010989010989011,
+    0.9108999108999108
+  ],
+  "best_sel_acc": 0.9123849123849124,
+  "best_step": 5800,
+  "val_acc": 0.8428899082568807,
+  "val_loss": 0.5546594624008451,
+  "val_n": 872,
+  "val_se": 0.012323362556411912,
+  "epochs": 3,
+  "lr": 3e-05,
+  "llrd": 1.0,
+  "batch": 32,
+  "checkpoint": "checkpoints/ckpt_sst2_jepa/best.pt",
+  "complete": true
+}

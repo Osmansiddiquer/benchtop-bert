@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from mini_enc_transformer.model.encoder import Encoder
+from mini_enc_transformer.arch import build_encoder
 from mini_enc_transformer.training.pretrain import build_tokenizer
 
 
@@ -93,9 +93,13 @@ class EncoderForSentiment(nn.Module):
     def __init__(self, ckpt_path, ids, n_classes=2, head_dropout=0.1, hidden_dropout=0.1,
                  d_model=768, d_embed=128, n_heads=4, n_layers=4, d_k=64, d_v=64):
         super().__init__()
-        self.encoder = Encoder(ids["vocab_size"], d_model, d_k, d_v, n_heads, n_layers,
-                               pad_id=ids["pad_id"], d_embed=d_embed)
+        # Architecture is DETECTED from the checkpoint, not taken from the n_layers /
+        # d_ff defaults -- those describe v1, and a v2 checkpoint (6L, d_ff 1792, GELU)
+        # otherwise dies with a wall of feed_forward size mismatches.
         sd = torch.load(ckpt_path, map_location="cpu")["model"]
+        self.encoder, self.arch = build_encoder(
+            sd, ids, d_model=d_model, d_k=d_k, d_v=d_v, n_heads=n_heads, d_embed=d_embed)
+        self.n_layers = self.arch["n_layers"]
         if any(k.startswith("head.") for k in sd):
             # A saved fine-tune checkpoint (encoder + head): load the whole thing.
             self.drop = nn.Dropout(head_dropout)
@@ -164,7 +168,8 @@ def main():
     model = EncoderForSentiment(ckpt, ids, head_dropout=a.head_dropout,
                                 hidden_dropout=a.hidden_dropout).to(a.device)
     opt = torch.optim.AdamW(
-        make_param_groups(model, a.lr, a.weight_decay, a.llrd), lr=a.lr)
+        make_param_groups(model, a.lr, a.weight_decay, a.llrd,
+                          n_layers=model.n_layers), lr=a.lr)
     total_steps = a.epochs * (a.max_train_batches or len(train_loader))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: lr_lambda(s, int(a.warmup_frac * total_steps), total_steps))

@@ -2,7 +2,7 @@
 # Wait for phase 3 to reach max_steps, then fine-tune ckpt3 on SST-2 with the new
 # defaults (llrd 1.0, lr 3e-5). Explicit --ckpt: the script would otherwise prefer
 # checkpoints/ckpt_sst2/best.pt (the v2 fine-tune) over the new backbone.
-cd /home/nimda/repos/transformer/transformer-v1
+cd "$(dirname "$0")/.."
 while true; do
   if [ "$(ps -eo comm,args | awk '$1=="python" && /train[.]py/' | wc -l)" -eq 0 ]; then
     read -r S M <<< "$(python - <<'PY'

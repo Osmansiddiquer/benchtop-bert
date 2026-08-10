@@ -17,12 +17,18 @@ class Encoder(nn.Module):
         )
         self.final_norm = nn.LayerNorm(d_model)
 
-    def forward(self, ids: torch.Tensor):
+    def forward(self, ids: torch.Tensor, output_hidden_states: bool = False):
         # ids: (B, T) int64 token ids -> (B, T, d_model)
         if ids.dim() != 2:
             raise ValueError(f"expected (B, T) token ids, got {tuple(ids.shape)}")
 
         x = self.pe(self.embedding(ids))
+        hidden = [] if output_hidden_states else None
         for block in self.encoder_blocks:
             x = block(x)
-        return self.final_norm(x)
+            if output_hidden_states:
+                hidden.append(x)
+        out = self.final_norm(x)
+        # Latent-target objectives (data2vec/JEPA) average the top-K block outputs
+        # rather than using only the last -- a single layer is a noisier target.
+        return (out, hidden) if output_hidden_states else out

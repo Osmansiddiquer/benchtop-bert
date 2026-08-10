@@ -1,0 +1,964 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{float}
+\usepackage{titlesec}
+
+\captionsetup{font=small,labelfont=bf}
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{0.7em}{}
+\setlist{itemsep=2pt,topsep=3pt,parsep=0pt}
+
+\newcommand{\dff}{\texttt{d\_ff}}
+\newcommand{\dmodel}{\texttt{d\_model}}
+\newcommand{\WO}{\ensuremath{W_O}}
+\newcommand{\nats}[1]{\ensuremath{#1}\,nats}
+
+\title{\bfseries Grafts, Depth, and Diagnostics\\[0.3em]
+\large A 28M-parameter encoder under a hard parameter cap:\\
+what two weeks of laptop-scale experiments established}
+
+\author{osmansiddiquer\\\small\texttt{transformer-v1}}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We built a BERT-style encoder from scratch---attention, blocks, embeddings and MLM head, with
+only the tokenizer borrowed---and pretrained it on a single 4\,GB laptop GPU under a hard
+30M-parameter cap. The goal was to buy downstream accuracy with architecture and data
+interventions rather than parameters. Several components worked and are reported with
+controls: a staged data curriculum, replay mixing (with a corpus held at 0\% replay as the
+negative control, losing \nats{0.95} against \nats{0.25} for replayed corpora), span masking,
+and a two-phase procedure that installs an induction circuit into a masked language model,
+raising copy-from-context accuracy from 0.8\% to 93\%. The headline goal nonetheless failed:
+a \nats{0.435} (16\%) improvement in held-out MLM loss produced no measurable SST-2 gain,
+because at 872 dev examples the measurement instrument (SE $\approx$ 1.2\,pp) is coarser than
+every effect we produced.
+
+The principal technical contribution is a measured correction to the folklore on
+function-preserving layer grafting. Zero-initialised grafting is usually said to be exact only
+in pre-LN architectures. We show it is exact in \emph{post-LN} as well, under two conditions
+that are not usually stated: the block must be appended at the \emph{top} of the stack, and its
+LayerNorm affine parameters must be \emph{reset} to $(\gamma{=}1,\beta{=}0)$ rather than copied
+from the donor layer. Copying them costs \nats{{+}4.12}; resetting them costs
+\nats{0.000} (max $|\Delta\text{logit}| = 1.3\times10^{-3}$ against a mean logit magnitude of
+3.82). Inserting the same block mid-stack costs \nats{{+}0.23} regardless.
+
+We further show that a sixth layer at this scale has no work to do under three independent
+initialisations; that single-layer ablation cost over-attributes, with
+$\mathrm{marginal}(L_4\mid L_3) = -1.891$; that every correlational diagnostic we built
+misled at least once while causal ablation never did; that annealing corpus dominates
+annealing schedule by $11\times$; and that changing only the evaluation mixture moves reported
+validation loss by \nats{0.225}---over half the size of the project's entire pretraining
+progress. Total cost: 35.4 GPU-hours, $\approx$3.0B tokens processed.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+
+%======================================================================
+\section{Introduction}
+
+The constraint that shaped this project was a hard cap of 30M parameters, on a single RTX
+3050 Ti Laptop GPU with 4\,GB of VRAM. Under such a cap the interesting question is not
+\emph{how well can this do}---the answer is known to be ``worse than BERT-base''---but
+\emph{how much of the gap can be closed by spending the budget better}. We attacked that
+question with architecture surgery (structured pruning, layer grafting, depth reallocation),
+data curriculum design, masking-scheme changes, an alternative pretraining objective, and a
+battery of diagnostic tooling.
+
+This report is organised around what the experiments actually established rather than around
+the chronology. Section~\ref{sec:setup} gives the setup and the evaluation protocol, which
+turned out to matter more than most of the interventions. Section~\ref{sec:worked} reports the
+components that demonstrably worked, with controls. Section~\ref{sec:graft} is the main
+technical contribution: a measured, corrected recipe for function-preserving layer grafting in
+post-LN transformers. Sections~\ref{sec:depth}--\ref{sec:width} report the negative and
+diagnostic results. Section~\ref{sec:eng} collects engineering findings that cost real time.
+Section~\ref{sec:scoreboard} presents the final scoreboard and the project's central negative
+result. Section~\ref{sec:lessons} states what we would do differently.
+
+Full checkpoint lineage, per-run configuration and the chronological build log are in the
+repository (\texttt{checkpoints/HISTORY.md}, \texttt{WORKLOG.md}).
+
+%======================================================================
+\section{Setup}\label{sec:setup}
+
+\subsection{Model}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lll}
+\toprule
+& v1 line & v2 line (final) \\
+\midrule
+parameters                  & 28.733M & \textbf{27.952M} \\
+layers / heads              & 4 / 4   & 6 / 4 \\
+\dmodel, $d_k = d_v$        & 768, 64 & 768, 64 \\
+\dff, activation            & 3072, ReLU & 1792, GELU \\
+embedding                   & \multicolumn{2}{l}{ALBERT-factorised $V{\times}128$ then $128{\to}768$ (38.6M $\to$ 6.5M)} \\
+MLM head                    & \multicolumn{2}{l}{tied to the word-embedding table} \\
+normalisation               & \multicolumn{2}{l}{\textbf{post-LN}} \\
+sequence length             & \multicolumn{2}{l}{128, contiguous packing (no padding, hence no attention mask)} \\
+masking (train)             & BERT 80/10/10 scattered & geometric spans, $p{=}0.2$, clipped at 10 \\
+masking (eval)              & scattered & scattered \\
+\bottomrule
+\end{tabular}
+\caption{Architectures. The tokenizer is \texttt{allenai/OLMo-1B-hf} with an added
+\texttt{[MASK]} (id 50280, vocab 50281). There is no \texttt{[CLS]}: OLMo has none and NSP was
+dropped, so downstream classification mean-pools the encoder states.}
+\end{table}
+
+Parameter split of the v2 model: FFN 16.53M (59\%), embedding and projection 6.53M (23\%),
+attention 4.72M (17\%), norms 0.02M. Attention holds roughly half the share it does in
+BERT-base ($\approx$33\%): with $n_\text{heads}\cdot d_k = 256$ against $\dmodel = 768$, each
+block writes a rank-$\leq$256 update into a 768-dimensional stream. This asymmetry recurs
+below.
+
+\subsection{Data}
+
+Corpora were tokenised to packed \texttt{uint16} memmaps with contiguous packing (documents
+joined by EOS, every block full): WikiText-103 119M tokens, UltraFineWeb-en 341M, TinyStories
+475M, Cosmopedia 403M, IMDB 23M.
+
+\subsection{Training}
+
+bf16, AdamW, micro-batch 16 $\times$ gradient accumulation 16 (effective batch 256). Measured
+VRAM fit on the 3050 Ti, which fixed the micro-batch:
+
+\begin{center}\small
+\begin{tabular}{rrrl}
+\toprule
+micro-batch & peak VRAM & ms/step & verdict \\
+\midrule
+16 & 1.84\,GB & 91   & safe default; leaves the machine usable \\
+32 & 3.25\,GB & 188  & works if the GPU is otherwise idle \\
+48 & 4.63\,GB & 507  & spills to WSL2 shared memory \\
+64 & 6.03\,GB & 1751 & heavy spill \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Evaluation protocol}\label{sec:protocol}
+
+Every cross-model number in this report is scored on \textbf{one fixed held-out mixture}: the
+tail 1\% of each Phase-A corpus, token-weighted 55/35/10 (Cosmopedia / UltraFineWeb /
+TinyStories), with an identical RNG seed so that all models see byte-identical masked inputs.
+Two masking schemes are reported: \texttt{scattered} (BERT 15\%, 80/10/10) and \texttt{span}
+(geometric $p{=}0.2$, clipped at 10, mean span 3.80). Fifteen batches of $16\times128$; eval
+noise is $\approx\pm$\nats{0.05}.
+
+This protocol was introduced late. Adopting it retroactively converted an entirely
+uncomparable set of run logs into a comparable table, and Section~\ref{sec:evalvalid} quantifies
+what its absence had been costing.
+
+%======================================================================
+\section{What worked}\label{sec:worked}
+
+\subsection{Data curriculum: the largest single lever in the project}
+
+The staged curriculum---WikiText-103, then UltraFineWeb, then a replay mixture with
+TinyStories and IMDB, then a Cosmopedia-weighted mixture---produced the two largest
+improvements we recorded, both of them corpus changes rather than architecture changes.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{llrr}
+\toprule
+checkpoint & data added & scat\_loss & $\Delta$ \\
+\midrule
+\texttt{ckpt}   & WikiText-103, 119M          & 5.9866 & --- \\
+\texttt{ckpt2}  & + UltraFineWeb              & 3.0389 & $-2.948$ \\
+\texttt{ckpt3}  & + TinyStories + IMDB (replay) & 2.7089 & $-0.330$ \\
+\texttt{ckpt\_v2} & + Cosmopedia (55\% weight), 734M & 2.3280 & $-0.381$ \\
+\texttt{ckpt\_v2\_anneal\_cosmo} & 4k-step Cosmopedia anneal & \textbf{2.2738} & $-0.054$ \\
+\bottomrule
+\end{tabular}
+\caption{Data curriculum on the fixed held-out mixture (\S\ref{sec:protocol}). The architecture
+change between rows 3 and 4 is analysed separately in \S\ref{sec:width}; the corpus change is
+the dominant term.}
+\end{table}
+
+Cosmopedia was weighted highest in Phase A on an explicit argument: it was the only genuinely
+\emph{new} data, since \texttt{ckpt3} had already seen UltraFineWeb for $\approx$2.5 epochs,
+near the point where repeats stop paying. The per-corpus breakdown below confirms this
+paid---Cosmopedia improved by \nats{0.81} while everything else moved by a quarter of that.
+
+\subsection{Replay mixing works, and we have the control}
+
+Continued pretraining on a new corpus normally causes catastrophic forgetting. We mixed each
+new phase with replay from earlier corpora. IMDB provides an unintentional but clean negative
+control: it was dropped entirely from the v2 mixture while the other three corpora were
+retained at 55/35/10.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+checkpoint & UltraFineWeb & TinyStories & IMDB & Cosmopedia \\
+\midrule
+\texttt{ckpt}  (WikiText only)          & 5.9660 & 5.4163 & 6.0371 & 6.3295 \\
+\texttt{ckpt2} (+UFW)                   & 2.8882 & 2.4936 & 3.8784 & 3.4847 \\
+\texttt{ckpt3} (+TinyStories+IMDB, replay) & 2.9511 & 1.0227 & 2.9255 & 3.1006 \\
+\texttt{ckpt\_v2} (+Cosmopedia, replay) & 3.2132 & 1.2459 & 3.8733 & 2.2875 \\
+\texttt{ckpt\_v2\_anneal\_cosmo} (final)& 3.3605 & 1.3430 & 3.9433 & 2.1129 \\
+\bottomrule
+\end{tabular}
+\caption{Per-corpus held-out scattered MLM loss. Each column is a separate held-out split;
+columns are not comparable to each other, only down.}
+\end{table}
+
+Reading the \texttt{ckpt3} $\to$ \texttt{ckpt\_v2} transition against the replay weight:
+
+\begin{center}\small
+\begin{tabular}{lrr}
+\toprule
+corpus & weight in the v2 mixture & $\Delta$ loss \\
+\midrule
+Cosmopedia    & 55\% (new)       & $-0.813$ \\
+UltraFineWeb  & 35\%             & $+0.262$ \\
+TinyStories   & 10\%             & $+0.223$ \\
+IMDB          & \textbf{0\%}     & \textbf{+0.948} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Any replay at all held forgetting to $\approx$\nats{0.25}; zero replay cost \nats{0.95}, close
+to four times as much, and dropping from 35\% to 10\% cost nothing measurable. The practical
+reading is that the replay \emph{floor} matters much more than the replay \emph{fraction}: a
+token budget of 10\% is enough, and 0\% is not.
+
+The same table also characterises what annealing does, honestly. The Cosmopedia anneal improved
+Cosmopedia by \nats{0.175} and degraded all three other corpora (UltraFineWeb $+0.147$,
+TinyStories $+0.098$, IMDB $+0.070$). Annealing \emph{specialises}; it does not uniformly
+improve. This is why the anneal simultaneously measured $-0.054$ on the Phase-A mixture and
+$+0.057$ on IMDB, an apparent contradiction at the time.
+
+\subsection{Span masking}
+
+Following SpanBERT, the v2 line trains on geometric span masking ($p{=}0.2$, clipped at 10,
+mean span 3.80) and evaluates on scattered masking so the logged accuracy stays comparable with
+earlier runs. Span masking removes the ability to infill from immediate neighbours, forcing
+representation rather than local autocomplete.
+
+It worked, on two independent readings. First, the model improved \emph{more} on the harder
+task than on the easier one: from \texttt{ckpt3} to the final model, scattered accuracy rose
+4.6\,pp while span accuracy rose 6.7\,pp. Second, the intrinsic difficulty gap between the two
+schemes narrowed, from \nats{{+}1.932} for the scattered-trained \texttt{ckpt3} to
+\nats{{+}1.640} for the span-trained final model---a \nats{0.29} narrowing that is six times
+eval noise.
+
+That gap is large enough to be worth stating on its own, because it is a frequent source of
+false alarms. Measured on one fixed model with identical data and seed:
+
+\begin{center}\small
+\begin{tabular}{lrrrr}
+\toprule
+masking scheme (\texttt{mlm\_prob} 0.15) & mean span & mlm\_loss & masked\_acc & vs scattered \\
+\midrule
+scattered            & 1.16 & 2.3655 & 0.5814 & --- \\
+uniform 2--4         & 2.94 & 3.5002 & 0.4362 & $+1.135$ \\
+geometric $p{=}0.2$  & 3.64 & 4.1054 & 0.3662 & $\mathbf{+1.740}$ \\
+geometric $p{=}0.1$  & 5.36 & 4.4758 & 0.3186 & $+2.110$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A model that trains on spans and evaluates on scattered will show train and validation curves
+$\approx$\nats{1.7} apart \emph{by design}. Anyone reading those logs without this table would
+diagnose a catastrophic bug.
+
+\subsection{WSD with the decay phase left unspent}
+
+\texttt{ckpt3} used cosine decay to zero and demonstrated that it bought nothing: the best
+validation loss arrived at step 6{,}400 while the learning rate was still at 55\% of peak, and
+the fully annealed endpoint was \emph{worse} than the mid-run best. Every later run therefore
+used Warmup--Stable--Decay with \texttt{decay\_frac = 0}, ending flat.
+
+Two benefits followed. The run stays extendable without a re-warm, and the decay phase becomes
+a separate, controllable experiment---which is exactly what made the corpus-controlled
+annealing comparison of \S\ref{sec:anneal} possible at all. Spending the decay is a decision;
+it should not be a side effect of the schedule.
+
+\subsection{Installing an induction circuit into a masked language model}\label{sec:autoreg}
+
+We coerced the encoder into an autoregressive generator---append three \texttt{[MASK]} tokens,
+supervise and commit slot 1, slide the window---as a probe of what the MLM had absorbed. Two
+capabilities were missing and both were installable in minutes of CPU-class fine-tuning.
+
+\begin{itemize}
+\item \textbf{Termination.} The base model never emits EOS in a generation loop. Oversampling
+EOS positions (30\% of supervised slots) during a 400-step continuation fine-tune fixes this.
+\item \textbf{Copy-from-context is absent at baseline: 0.8\%.} Induction requires a two-layer
+circuit---a previous-token head feeding a copy head---and four heads per layer leave no room
+for one to form incidentally under a masked objective. A 600-step fine-tune on two-entity
+templates (25\% of the batch, the rest replay) raises copy accuracy to \textbf{93.3\%} on
+trained-style prompts and \textbf{80.0\%} on 200 entities held out of the training pool, in
+6.5 minutes.
+\end{itemize}
+
+The generalisation to held-out entities is what makes this a circuit rather than memorisation.
+The result is that the capability was \emph{cheap and absent}: nothing in 2.1B tokens of MLM
+pretraining gave the model a reason to build it, and once given a reason it built it in
+6.5 minutes.
+
+Two honest caveats. The fine-tune over-corrects at high copy weight---\emph{``We went to Paris
+last year with Maria. I loved chatting with''} completes to \emph{``Paris last year with
+Maria''}. And there is an open failure: generation loops on prompts shorter than 8 tokens,
+because training sampled context length uniformly over $[8, 125]$ while generation
+\emph{starts} at the prompt length. All four sub-8-token prompts break; all five longer prompts
+are clean. The fix (log-uniform context sampling from length 1) is identified but not
+implemented.
+
+\subsection{The diagnostic tooling}
+
+The tools in \texttt{tools/} are themselves a result. Three earned their cost repeatedly:
+\texttt{span\_eval.py} (the fixed-protocol evaluation of \S\ref{sec:protocol}),
+\texttt{layer\_contrib.py} (causal ablation cost, single and pairwise, \S\ref{sec:depth}), and
+\texttt{audit\_eval.py} (which mechanically checks the failure modes of
+\S\ref{sec:evalvalid}). Each converted a recurring argument into a number.
+
+%======================================================================
+\section{Function-preserving grafts in post-LN transformers}\label{sec:graft}
+
+\subsection{The problem}
+
+Growing a trained network by adding layers---progressive stacking, bert2BERT, Net2Net---is
+meant to be near-free: the new layer starts from a useful function and training continues from
+a good point. The standard trick for making it \emph{exactly} free is to zero the new block's
+output projections so that the block is an identity at step 0.
+
+This is folklore for \textbf{pre-LN} architectures, where a block computes $x + f(\mathrm{LN}(x))$
+and $f \equiv 0$ genuinely is the identity. Our model is \textbf{post-LN}:
+\begin{align}
+h   &= \mathrm{LN}_1\!\left(\mathrm{MHA}(x) + x\right), \\
+\text{out} &= \mathrm{LN}_2\!\left(\mathrm{FFN}(h) + h\right).
+\end{align}
+With $\WO = 0$ and $W_\text{out} = 0$ this collapses to
+$\text{out} = \mathrm{LN}_2(\mathrm{LN}_1(x))$---two extra LayerNorms, not an identity. We
+measured what that costs and found the folklore is recoverable in post-LN, subject to two
+conditions that are not usually stated.
+
+\subsection{Measurement}
+
+All variants below are built from the same trained 4-layer checkpoint (\texttt{ckpt3}) by
+appending \emph{one} block, and are scored under the protocol of \S\ref{sec:protocol}. Because
+building a v2-package model also swaps ReLU for GELU, $\Delta$ is reported against the
+GELU-only reference so the activation change is factored out.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+variant (one block appended to a trained 4L stack) & scat\_loss & $\Delta$ vs ref & $\max|\Delta\text{logit}|$ \\
+\midrule
+\texttt{ckpt3}, 4L, ReLU --- the source model                       & 2.7089 & ---      & --- \\
+GELU swap only, still 4L --- \textbf{the reference}                 & 2.9776 & $0.000$  & --- \\
+$\WO{=}0$, $W_\text{out}{=}0$, LN affines reset to $(1,0)$          & \textbf{2.9776} & $\mathbf{+0.000}$ & $\mathbf{0.0013}$ \\
+$\WO{=}0$, $W_\text{out}{=}0$, LN affines \emph{copied from donor}  & 7.1016 & $+4.124$ & $37.7$ \\
+only $W_\text{out}{=}0$ (attention live), LN copied                 & 7.7290 & $+4.751$ & --- \\
+full copy-stack --- \emph{what this project actually did}           & 8.5488 & $+5.571$ & --- \\
+\bottomrule
+\end{tabular}
+\caption{Decomposing the cost of adding a layer to a trained post-LN stack.}
+\label{tab:graft}
+\end{table}
+
+The mean logit magnitude is 3.82, so $\max|\Delta\text{logit}| = 1.3\times10^{-3}$ is float32
+round-off (a relative error of $3.3\times10^{-4}$): the corrected graft is \textbf{exactly} function-preserving. The naive graft
+destroys the model.
+
+\subsection{Why it works, and where it stops working}
+
+A zero-output post-LN block computes $\mathrm{LN}(\mathrm{LN}(x))$, which with unit affines
+equals $\mathrm{LN}(x)$---a per-token standardisation of $x$. That is \emph{not} $x$. But
+LayerNorm is invariant to per-token affine rescaling,
+\begin{equation}
+\mathrm{LN}(a\,x + b\,\mathbf{1}) = \mathrm{LN}(x), \qquad a > 0,\ b \in \mathbb{R},
+\label{eq:lninv}
+\end{equation}
+and $\mathrm{LN}(x)$ is itself exactly such a rescaling of $x$ (with $a = 1/\sigma$,
+$b = -\mu/\sigma$). So if the \emph{next} consumer of the stream is another LayerNorm, the
+standardisation is annihilated and the graft is invisible.
+
+At the \textbf{top} of the stack the only consumer is the encoder's final LayerNorm, and
+(\ref{eq:lninv}) applies exactly. \textbf{Mid-stack}, the next block's attention reads the
+residual stream \emph{directly}---attention logits scale as the square of the stream
+magnitude---while the graft has just stripped the previous block's learned output scale
+$(\gamma,\beta)$. Equation~(\ref{eq:lninv}) no longer applies:
+
+\begin{center}\small
+\begin{tabular}{lrr}
+\toprule
+insertion point of the zero-graft block (5L/3072) & scat\_loss & $\Delta$ \\
+\midrule
+nowhere --- 4L reference                    & 2.9776 & --- \\
+position 0 (before all trained blocks)      & 3.0646 & $+0.087$ \\
+position 2 (mid-stack)                      & 3.2021 & $+0.225$ \\
+position 4 (appended at top)                & \textbf{2.9776} & $\mathbf{+0.000}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Position 0 is cheaper than position 2 only because the embedding-plus-positional stream it
+re-standardises is less shaped by a learned LayerNorm than a mid-stack activation is.
+
+\subsection{The counter-intuitive term}
+
+The dominant error is \textbf{copying the donor block's LayerNorm affines}: \nats{{+}4.12} of
+the \nats{{+}5.57} total. Every instinct in progressive stacking says to copy everything from a
+trained layer---that is the entire argument for stacking over random initialisation. For the
+LayerNorm affines specifically, copying is worse than resetting by more than four nats, because
+$\gamma$ and $\beta$ encode \emph{what scale the next layer expects}, and a newly inserted
+block inherits the wrong expectation.
+
+\subsection{Practical rules}
+
+\begin{enumerate}[label=(\alph*)]
+\item \textbf{Post-LN:} zero-init grafting is exact \emph{only at the top of the stack}, and
+only with $\WO = 0$, $W_\text{out} = 0$, \textbf{and LayerNorm affines reset to $(1,0)$}.
+Mid-stack, budget $\approx$\nats{0.2}.
+\item \textbf{Copy weights, reset norms.} Inherit the residual-branch parameters; do not
+inherit $\gamma$ and $\beta$.
+\item \textbf{Verify with logits, not loss.} Our first check compared loss on a small batch and
+read a plausible-looking delta. Comparing $\max|\Delta\text{logit}|$ against the mean logit
+magnitude turns a judgement call into a pass/fail: $1.3\times10^{-3}$ versus $37.7$ is not a
+debate. The verification belongs \emph{inside} the tool that performs the graft.
+\item \textbf{A destroyed output does not mean destroyed knowledge.} \texttt{ckpt\_v2\_init}
+scored \nats{8.26}. It recovered to \nats{2.71}---its parent's level---within
+1{,}000 steps, and to \nats{2.38} by step 14{,}200, a level \texttt{ckpt3} needed $\approx$42{,}000
+cumulative steps to reach. Loss immediately after a graft is a very poor proxy for how much
+transferred.
+\end{enumerate}
+
+%======================================================================
+\section{Depth at 28M: the sixth layer}\label{sec:depth}
+
+We grew 4 layers to 6 by cutting \dff{} from 3072 to 1792 and spending the savings on depth.
+Layer 5 pulled its weight. \textbf{Layer 4 did not.}
+
+\subsection{Ablation cost: a causal metric}
+
+Correlational metrics (utilisation, effective rank, head similarity) describe what a layer
+\emph{looks like}. We wanted what it is \emph{worth}, so we defined \textbf{ablation cost}: zero
+the layer's output projections ($\WO$, $l_2$, $b_2$), leaving the residual path intact, and
+measure the increase in held-out loss.
+
+\begin{center}\small
+\begin{tabular}{lrrrrrr}
+\toprule
+layer & 0 & 1 & 2 & 3 & \textbf{4} & 5 \\
+\midrule
+ablation cost (nats) & 1.186 & 1.683 & 1.749 & 1.594 & \textbf{0.073} & 0.963 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Layer 4 is worth 7.6\% of what its neighbour layer 5 is worth, and 1.0\% of the stack's total
+ablation cost, while holding an identical 12.7\% share of the parameters.
+
+\subsection{Three initialisations, one answer}
+
+\begin{center}\small
+\begin{tabular}{lrr}
+\toprule
+initialisation of layer 4 & steps trained & final ablation cost \\
+\midrule
+stacked copy of a trained layer                     & 9{,}600  & $\approx 0$ \\
+zero-init graft, $5\times$ LR, no weight decay      & 4{,}600  & $\approx 0$ \\
+standard $\mathcal{N}(0,0.02)$, \emph{rest of the network frozen} & 18{,}800 & $\mathbf{+0.062}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The third run is the decisive one. Freezing embeddings, the MLM head and blocks
+$0,1,2,3,5$, leaving 3.545M of 27.952M parameters trainable (12.7\%), removes every escape
+route: the rest of the network \emph{cannot} route around layer 4, so whatever it can learn, it
+must. It climbed from 0 to \nats{{+}0.062} over 18{,}800 steps and flattened, which is
+$\approx$6\% of layer 5's contribution.
+
+\textbf{Verdict: position, not initialisation.} At this depth and scale there is no work
+available at slot 4 that existing redundancy in layers 1, 2 and 5 does not already absorb.
+Transplanting the frozen-trained layer back into the joint run improved loss by
+\nats{-0.056} instantly---and joint training gave most of it back within 200 steps. The joint
+optimiser actively \emph{prefers} the configuration in which layer 4 does nothing.
+
+\subsection{Pairwise marginals change how ablation should be read}
+
+Single-layer ablation cost is not a clean attribution. We measured the full pairwise matrix,
+with $\mathrm{marginal}(i \mid j) = \mathrm{cost}(\{i,j\}) - \mathrm{cost}(\{j\})$:
+
+\begin{center}\small
+\begin{tabular}{lrrrrr}
+\toprule
+$j =$ & 0 & 1 & 2 & \textbf{3} & 5 \\
+\midrule
+$\mathrm{marginal}(4 \mid j)$ & $-0.012$ & $+0.031$ & $-0.019$ & $\mathbf{-1.891}$ & $+0.005$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Layer 4 is worth $\approx$0 given \emph{any} other layer removed, so redundancy is not the
+explanation---nothing was covering for it. But at $j = 3$, \textbf{removing the useless layer 4
+halves the apparent cost of removing layer 3} ($3.437 \to 1.545$).
+
+The mechanism is fragility amplification. Ablating layer 3 produces an off-distribution
+residual stream; layer 4, trained only on in-distribution input, amplifies that corruption
+rather than absorbing it. Layer 3's headline cost of \nats{3.44} is therefore
+$\approx$55\% damage routed through layer 4 and only $\approx$45\% its own contribution.
+
+\textbf{Rule: single-layer ablation cost over-attributes to layers sitting below a fragile
+downstream layer.} For pruning decisions the pairwise marginal is the number wanted, and it can
+differ from the single by a factor of two.
+
+%======================================================================
+\section{Diagnostics that mislead}\label{sec:diag}
+
+We built five diagnostics. Four of them lied at least once, in ways worth cataloguing.
+
+\subsection{Head similarity had a null of $\approx$0.97, not 0}
+
+The maximum pairwise cosine between heads' attention matrices read 0.98 on layer 3, apparently
+indicating duplicate heads. It does not: \textbf{an untrained model reads 0.95--0.99 as well.}
+Attention rows are probability distributions over 128 positions; an undifferentiated head sits
+near-uniform, and the shared $1/T$ floor dominates the cosine. The metric could not distinguish
+``duplicated heads'' from ``untrained heads''---precisely the two cases it existed to separate.
+
+Centring across heads before taking the cosine restores a meaningful null. Measured on a
+freshly initialised model: \textbf{raw 0.95--0.99, centred $-0.23$ to $-0.07$}. The null is
+\emph{negative} because four centred vectors sum to zero, so undifferentiated heads are
+mutually anti-correlated.
+
+A second bug compounded the first: zeroing the diagonal before the argmax both won the argmax
+and clamped the reported maximum, so the tool reported the nonsense pair $h_0 \sim h_0$ at
+0.00. The diagonal must be $-\infty$.
+
+After the fix, layer 3's 0.98 survived (genuinely duplicated) while layers 4 and 5's 0.86 and
+0.98 collapsed to 0.18 and 0.27---they were untrained, not duplicated. Every conclusion drawn
+from the uncentred metric had to be discarded.
+
+\subsection{The same failure one level up: latent-target pretraining}
+
+We ran a data2vec/JEPA-style latent-prediction branch (EMA teacher, stop-gradient, narrow
+predictor, momentum $0.996 \to 0.999$) for 15{,}258 steps on 500M tokens. Every internal metric
+was encouraging.
+
+\begin{center}\small
+\begin{tabular}{rrrrrr}
+\toprule
+step & centred cos & raw cos & constant-predictor baseline & eff.\ rank & target std \\
+\midrule
+200     & 0.0357 & 0.886 & 0.916 & 240.9 & 0.349 \\
+8{,}600 & 0.6161 & 0.944 & 0.907 & 232.9 & 0.363 \\
+15{,}200& \textbf{0.6256} & 0.940 & 0.895 & 234.8 & 0.382 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Note the raw cosine at step 200: \textbf{0.886, against a constant-predictor baseline of
+0.916}. A predictor that ignored its input entirely and emitted the dataset mean would have
+scored \emph{higher}. Representations are anisotropic; almost any two vectors are similar. The
+honest number was 0.0357.
+
+We caught that one. What we did not catch until downstream evaluation is that the \emph{whole
+class} of internal metric was uninformative here: centred cosine rose $17\times$, effective
+rank held steady, target standard deviation improved monotonically---and the downstream result
+was indistinguishable from the far simpler MLM line (\S\ref{sec:scoreboard}).
+
+\subsection{Zero-output layers poison run-level aggregates}
+
+FFN-slack and attention-health tools reported \texttt{slack = 100\%}, \texttt{util = 1.00},
+\texttt{out\_rank = nan} for a freshly grafted layer whose output projection is identically
+zero. Those rows entered the run-level means and flipped an automated verdict to ``OK'' for
+several monitoring cycles. Any health metric of the form \emph{``how much of this layer's
+output matters''} is undefined when the output is zero by construction; the tool must detect
+and exclude that case rather than average it in.
+
+\subsection{The general lesson}
+
+\textbf{Every proxy metric needs its null measured on an untrained model of the same
+architecture, and its degenerate cases enumerated, before it is trusted once.} Ablation cost
+was the only diagnostic we never had to retract, because it is defined by an intervention on
+the model rather than by a statistic of its activations. It is also $\approx$40$\times$ more
+expensive per reading. That trade was worth it.
+
+%======================================================================
+\section{Annealing: corpus dominates schedule}\label{sec:anneal}
+
+Phase A used WSD with \texttt{decay\_frac = 0}, deliberately leaving the decay phase unspent. We
+then spent it twice from the \emph{identical} checkpoint with \emph{identical} learning rate,
+schedule, seed and step count (cosine $2\times10^{-4} \to 0$, no warmup, 4{,}000 steps),
+varying only the corpus.
+
+\begin{center}\small
+\begin{tabular}{lrll}
+\toprule
+anneal corpus & own val\_loss & held-out result vs parent & outcome \\
+\midrule
+TinyStories & \textbf{0.9989} & fell \emph{below} \texttt{ckpt3} within 1{,}800 steps & abandoned \\
+Cosmopedia  & 2.0487 & $-0.054$ nats, $+1.18$\,pp span acc & kept; final model \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+TinyStories produced by far the lowest validation loss the project ever recorded, and it was
+pure artefact: TinyStories is deliberately constructed with a $\approx$1{,}500-word vocabulary
+at a three-to-four-year-old reading level. Annealing on it \emph{narrows the lexicon}; it does
+not teach fluency. It lost three quarters of v2's entire advantage over \texttt{ckpt3} in 800
+steps. Cosmopedia---the same schedule on synthetic textbook prose---did \textbf{11$\times$ less
+damage} and net helped.
+
+Because everything except the corpus was held fixed, this isolates data register as the causal
+variable. \textbf{Annealing is a data-selection decision, not a schedule trick, and the loss on
+the anneal corpus itself carries no information about whether it worked.}
+
+%======================================================================
+\section{Evaluation validity}\label{sec:evalvalid}
+
+Late in the project a reported validation loss of $\approx$2.04 looked implausibly good---a
+well-trained 124M-parameter GPT-2 on 10B tokens lands near 3.3, and we would have been beating
+it with a quarter of the parameters and 7\% of the data. We audited it against the standard
+failure modes.
+
+\paragraph{1. It was a different task.} Masked language modelling is not autoregressive language
+modelling; bidirectional context makes the token far easier to predict. There was no valid
+comparison to GPT-2 in the first place. A category error rather than a bug, but the most
+consequential item on the list.
+
+\paragraph{2. The eval mixture, not the model, was doing most of the work.} For the \emph{same}
+checkpoint:
+
+\begin{center}\small
+\begin{tabular}{lr}
+\toprule
+evaluation mixture & scat\_loss \\
+\midrule
+Cosmopedia only (what that run logged)   & 2.0487 \\
+Phase-A mixture, 55/35/10 (the protocol) & 2.2738 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\nats{0.225} from the evaluation set alone---over half the size of the entire project's
+pretraining improvement (\nats{0.435}). Every run in this repository evaluates on its own
+training mixture by default, which makes the \texttt{val\_loss} column of any cross-run table
+meaningless.
+
+\paragraph{3. Cross-run contamination is real and easy to miss.} The split is contiguous
+(validation is the tail 1\%), so it is clean \emph{within} a run. But \texttt{limit\_tokens}
+changes where the boundary falls, and weights are inherited across runs:
+
+\begin{center}\small\ttfamily
+\begin{tabular}{ll}
+tinystories \quad n = 73.4M & train=[0, 72.6M) \quad val=[72.6M, 73.4M) \\
+\quad prior run & train=[0, 165.3M) $\to$ \textbf{VAL INSIDE PRIOR TRAIN: CONTAMINATED} \\
+\end{tabular}
+\end{center}
+
+v2's TinyStories validation range sits entirely inside \texttt{ckpt3}'s training range, and v2
+inherited \texttt{ckpt3}'s weights. UltraFineWeb was clean; TinyStories was not.
+
+\paragraph{4. Averaging bias was real but negligible.} Mean-of-batch-means 2.2743 against
+token-weighted 2.2760: a $-0.0016$ nat bias. Worth checking once; not worth worrying about.
+
+\paragraph{5. Data was not pathologically repetitive.} 0 of 320 validation blocks byte-matched
+any of 199{,}989 sampled training blocks. The top-8 scored tokens account for 22.5\% of scored
+positions across 2{,}357 distinct types---normal for English.
+
+\paragraph{6. The generalisation gap is small but nonzero.} Train-range 2.1427 against held-out
+2.3251: \nats{{+}0.18} and $-1.2$ accuracy points. Consistent with a capacity-bound,
+zero-dropout model that is not overfitting.
+
+%======================================================================
+\section{Width--depth reallocation}\label{sec:width}
+
+Three measurements on \texttt{ckpt3} motivated the v2 architecture:
+
+\begin{itemize}
+\item \textbf{\dff{} was $\approx$3.5$\times$ oversized.} 99\% of FFN activation variance fit in
+133--866 of 3{,}072 directions, depending on layer.
+\item \textbf{Layer 0 had 2{,}697 of 3{,}072 units that never fired once} over 2.0M tokens under
+ReLU.
+\item \textbf{Residual-stream effective rank was still climbing at the last layer}
+($149 \to 269 \to 483 \to 523$ of 768), so depth had headroom where width did not.
+\end{itemize}
+
+We therefore cut \dff{} to 1792, swapped ReLU for GELU---and, importantly, scored the pruning
+importances \emph{under GELU}, because scoring under ReLU would discard units whose
+pre-activations are negative (2{,}755 of them in layer 0) that GELU passes with a small
+non-zero output---and spent the savings on two extra layers, landing at 27.952M under the cap.
+
+\textbf{The width cut cost almost nothing}, as predicted: structured pruning $3072 \to 1792$
+cost \nats{{+}0.083} on top of the activation swap. After training, $r_{99}/\dff \leq 0.56$ on
+every layer---width was still not the binding constraint even at 1792.
+
+\textbf{The depth it funded returned almost nothing}: layer 5 pulled its weight, layer 4 did not
+(\S\ref{sec:depth}), and the end-to-end gain did not survive to the downstream task
+(\S\ref{sec:scoreboard}).
+
+This is what scaling laws predict---performance depends on parameters, data and compute, and
+only weakly on architectural shape. We ran the experiment carefully enough to confirm rather
+than assume it, but the honest summary is that \textbf{reallocating a fixed parameter budget
+between width and depth is a rounding error compared with changing the budget.}
+
+%======================================================================
+\section{Engineering results}\label{sec:eng}
+
+\paragraph{Freezing 87\% of parameters buys 1.6$\times$, not 8$\times$.} The frozen-stack
+experiment trained only layer 4---12.7\% of parameters---at 0.858\,s/step against 1.397\,s/step
+for full joint training: $1.63\times$. The reason is FLOP structure, not parameter count. The
+forward pass is unchanged (all six layers), and the backward pass must still traverse layer 5
+to reach layer 4; only the four layers \emph{below} the trainable one skip backward. Predicted
+$1.8\times$, measured $1.63\times$. \textbf{Count the backward passes you actually skip, not the
+parameters you froze.}
+
+\paragraph{Budget by steps, not wall-clock, on a machine that sleeps.} A
+\texttt{--max-seconds 10800} budget using \texttt{time.time()} counted sleep and terminated a
+run at step 1{,}851 of 8{,}800 after 37 minutes of real compute.
+
+\paragraph{A watchdog inside the thing it watches is not a watchdog.} Every recovery mechanism
+we built initially lived inside the session that sleep suspended, dying at the same instant as
+the training it existed to observe. Moving it to cron covered crashes but not Windows sleep,
+which \emph{destroys} the WSL2 VM---confirmed by two distinct boot IDs with an 8h38m hole in
+\texttt{journalctl --list-boots}. There is no kernel running to fire cron.
+
+\paragraph{A watchdog that spawns a daemon can disable itself.} The supervisor held its lock on
+file descriptor 9; \texttt{setsid} children inherit open descriptors, so the long-lived
+dashboard \emph{it} spawned captured fd 9 and held the lock for its lifetime. Every subsequent
+cron tick died at \texttt{flock -n 9} and exited 0, silently, for $\approx$5 hours. The one
+recovery test that passed did so only because the dashboard alive at that moment had been
+started from a shell. \textbf{The act of the supervisor launching a daemon is what disabled the
+supervisor---that test could not have caught the bug however carefully it was run.} Verifying a
+watchdog once tells you nothing about whether it stays armed.
+
+\paragraph{\texttt{\$\{VAR:-default\}} substitutes on empty, not merely on unset.}
+\texttt{BOOST\_LAYERS=""} fell through to the default and silently launched two runs with a
+$5\times$ learning rate that had been explicitly ruled out. \texttt{\$\{VAR-default\}} is the
+correct form. Cost: two killed runs and two checkpoint restores.
+
+\paragraph{Grep for a process name and you will match your own shell.} A GPU-wait loop using
+\texttt{ps | awk '/pretrain\_v2/'} matched any command that merely \emph{mentioned} the string,
+including the monitoring commands, and wedged forever. Poll the resource
+(\texttt{nvidia-smi} VRAM), not the name.
+
+\paragraph{Sparse-file apparent size is not disk usage.} Packed \texttt{.bin} memmaps are
+allocated at target size and written incrementally; the holes cost zero real blocks.
+Truncating them to \texttt{tokens\_written} reduced apparent size from 3.7\,GB to 2.4\,GB and
+freed nothing---and requires updating the manifest in lockstep, since the dataset memmaps with
+\texttt{shape=(target\_tokens,)}.
+
+%======================================================================
+\section{Scoreboard, and the central negative result}\label{sec:scoreboard}
+
+\subsection{Pretraining progressed clearly}
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{llrrrr}
+\toprule
+checkpoint & step / arch & scat\_loss & scat\_acc & span\_loss & span\_acc \\
+\midrule
+\texttt{ckpt} --- WikiText-103            & 8{,}800 \; 4L/3072  & 5.9866 & 0.2531 & 6.9932 & 0.1695 \\
+\texttt{ckpt2} --- +UltraFineWeb          & 20{,}789 \; 4L/3072 & 3.0389 & 0.4819 & 4.9318 & 0.2884 \\
+\texttt{ckpt3} --- +TinyStories+IMDB      & 12{,}964 \; 4L/3072 & 2.7089 & 0.5295 & 4.6408 & 0.3118 \\
+\texttt{ckpt\_v2\_init} --- graft, untrained & 0 \; 6L/1792     & 8.2635 & 0.0125 & 8.4851 & 0.0075 \\
+\texttt{ckpt\_v2} @ 14.2k                 & 14{,}200 \; 6L/1792 & 2.3828 & 0.5661 & 4.0408 & 0.3588 \\
+\texttt{ckpt\_v2} @ 18.4k (pre-anneal)    & 18{,}400 \; 6L/1792 & 2.3280 & 0.5759 & 3.9809 & 0.3671 \\
+\texttt{ckpt\_v2\_l4only} --- frozen-stack L4 & 18{,}800 \; 6L/1792 & 2.3136 & 0.5781 & 3.9658 & 0.3695 \\
+\textbf{\texttt{ckpt\_v2\_anneal\_cosmo}} --- final & +4{,}000 \; 6L/1792 & \textbf{2.2738} & 0.5759 & \textbf{3.9135} & \textbf{0.3789} \\
+\bottomrule
+\end{tabular}
+\caption{All rows scored under the fixed protocol of \S\ref{sec:protocol}. \texttt{ckpt3} to
+final is $-0.435$ nats scattered, $-0.727$ nats span, $+6.7$\,pp span accuracy---$\approx9\times$
+eval noise and unambiguously real. The latent-target branch is absent because it never trained
+an MLM head; scoring it under MLM reads \nats{11.98} and means nothing.}
+\end{table}
+
+\subsection{Downstream did not}
+
+SST-2 dev is 872 examples: SE $\approx$ 1.2\,pp. STS-B dev is 1500: SE $\approx$ 1.7\,pp.
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lrrrrrr}
+\toprule
+model & \multicolumn{1}{c}{SST-2} & SST-2 & SST-2 & STS-B & STS-B & STS-B \\
+      & \multicolumn{1}{c}{standalone} & probe & ft & probe & ft & 0-shot \\
+\midrule
+\texttt{ckpt3}                    & 0.8567 & 0.7741 & 0.8509 & 0.5971 & 0.4199 & 0.5610 \\
+\texttt{ckpt\_jepa}               & 0.8429 & 0.7362 & \textbf{0.8647} & 0.6035 & \textbf{0.6111} & 0.4600 \\
+\texttt{ckpt\_v2\_anneal\_cosmo}  & \textbf{0.8601} & 0.7431 & 0.8509 & 0.5853 & 0.1434\,$^\dagger$ & 0.5558 \\
+\emph{BERT-base (110M)}           & \emph{$\approx$0.927} & & & & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\textbf{This is the project's central negative result.} A \nats{-0.435} improvement in held-out
+MLM loss produced a \textbf{0.0\,pp} change on the SST-2 fine-tune harness and $+0.34$\,pp
+(0.3\,SE) on the standalone harness. Nothing here is distinguishable from noise: the full
+spread across three very different pretraining regimes is 0.8509--0.8647, i.e.\ \textbf{1.1\,SE}.
+
+Worse for interpretation, \textbf{the two SST-2 harnesses disagree by more than any of our
+interventions moved the number.} The same final checkpoint reads 0.8601 standalone and 0.8509
+in the benchmark---a 0.92\,pp gap arising from selection protocol and split handling alone,
+against a 0.34\,pp effect size. And the latent-target branch, which the standalone harness
+ranked last, is the \emph{best} model on both benchmark fine-tunes.
+
+The honest reading is that at 28M parameters on an 872-example dev set, \textbf{we built a
+measurement instrument too coarse to detect what we were optimising.} Resolving a 1\,pp
+difference at this standard error would need roughly four times more labelled evaluation data.
+That should have been checked before the third architecture experiment, not after the last one.
+
+The remaining $\approx$7\,pp gap to BERT-base is capacity, not allocation. The final model's
+lineage processed $\approx$2.18B tokens---78 tokens per parameter, far past any compute-optimal
+ratio---while validation loss plateaued at the eval-noise floor and zero dropout produced no
+overfitting. All three signals point the same way.
+
+\vspace{0.5em}
+\noindent
+$^\dagger$ \texttt{stsb finetune = 0.1434} is broken, not a result: a fine-tune cannot
+legitimately land four times below its own frozen probe (0.5853). It read 0.29--0.32 throughout
+training, i.e.\ it diverged. The identical code gave 0.4199 and 0.6111 on other backbones.
+Undiagnosed.
+
+%======================================================================
+\section{What we would do differently}\label{sec:lessons}
+
+\begin{enumerate}
+\item \textbf{Size the evaluation before sizing the experiment.} SE $\approx$ 1.2\,pp on SST-2
+dev makes any intervention worth less than $\approx$2.5\,pp undetectable. We ran three
+architecture experiments against an instrument that could not resolve their effects. Either
+pick a task with a larger dev set, average over seeds, or accept up front that the experiment
+is qualitative.
+\item \textbf{Measure every proxy metric's null on an untrained model before trusting it once.}
+The head-similarity metric read 0.97 at random initialisation. Ten minutes of work would have
+caught it; instead it invalidated a week of readings.
+\item \textbf{Prefer causal metrics.} Ablation cost was $\approx$40$\times$ more expensive per
+reading and the only diagnostic never retracted. Budget for it.
+\item \textbf{Use pairwise marginals, not singles, for pruning decisions.}
+$\mathrm{marginal}(4 \mid 3) = -1.891$ means single-layer costs can be twice wrong, in the
+direction that matters.
+\item \textbf{Fix the evaluation mixture globally on day one.} Per-run \texttt{val\_loss} on a
+per-run mixture is not a metric; it is a diary entry. A single frozen held-out set turned an
+uncomparable results table into a comparable one, retroactively, in one afternoon.
+\item \textbf{Keep a replay floor, not a replay fraction.} 10\% replay retained as well as 35\%;
+0\% cost four times as much.
+\item \textbf{Do not spend a parameter budget reallocating shape.} At a fixed cap, width--depth
+trades are noise. If the cap is the constraint, the honest experiment is to raise it.
+\item \textbf{Verify function-preserving transforms with logits, automatically, inside the tool
+that performs them.} Our graft tool eventually refused to write when
+$|\Delta\text{loss}|$ exceeded a threshold. It should have compared logits from the start, and
+it should have existed before the first graft rather than after the third.
+\end{enumerate}
+
+%======================================================================
+\section{Limitations}
+
+Single seed throughout: no result here carries an error bar from repetition, only from
+evaluation-set size. MLM evaluation uses 15 batches ($\approx$30k tokens, $\pm$\nats{0.05}).
+
+The \S\ref{sec:graft} graft results are exact at the logit level and do not depend on seed. The
+\S\ref{sec:depth} layer-4 result replicates across three initialisations and 40+ ablation
+readings and is the strongest evidence in the report. The \S\ref{sec:anneal} $11\times$ ratio
+is a single pair of runs and should be read as an order of magnitude, not a coefficient. The
+replay-retention control in \S\ref{sec:worked} is one transition with four corpora at four
+weights, and the 0\% condition was not deliberately designed as a control. All downstream
+numbers are one fine-tune run each, and \S\ref{sec:scoreboard} argues they should not be
+over-read.
+
+The comparison to BERT-base is from published figures and is not a controlled comparison:
+different data, tokenizer, training budget and evaluation harness.
+
+%======================================================================
+\appendix
+\section{Reproducing the headline measurements}
+
+{\small\begin{verbatim}
+# Section 4 -- the graft ladder, end to end: builds every variant, scores it,
+# and runs the logit-level function-preservation check
+python tools/graft_ladder.py --device cuda
+
+# fixed cross-model MLM evaluation (the only comparable pretraining numbers)
+python tools/span_eval.py \
+    --ckpt checkpoints/ckpt_v2_anneal_cosmo/last.pt \
+    --baseline checkpoints/ckpt3/last.pt --device cuda
+
+# causal layer value: single + pairwise ablation cost
+python tools/layer_contrib.py --full \
+    --ckpt checkpoints/ckpt_v2_anneal_cosmo/last.pt
+
+# graft variants: --new-layer-init {stack,random,zero}, --n-layers, --d-ff
+python tools/build_v2_from_ckpt3.py --n-layers 5 --d-ff 3072 \
+    --new-layer-init zero --out /tmp/graft.pt
+
+# is the reported val loss measuring what it claims?
+# (--data-name is one unbroken line; wrapped here for width)
+python tools/audit_eval.py --device cuda \
+    --ckpt checkpoints/ckpt_v2_anneal_cosmo/last.pt \
+    --data-name "cosmopedia:403451249:403451249,
+                 ultrafineweb_en:256832885:256832885,
+                 tinystories:73377468:73377468" \
+    --prior-runs "ultrafineweb_en:167000000,tinystories:167000000"
+
+# masking-scheme difficulty offsets
+python tools/masking_difficulty.py --ckpt checkpoints/ckpt3/last.pt
+
+# attention health -- head_sim is CENTRED; the raw null is ~0.97
+python tools/attn_health.py \
+    --ckpt checkpoints/ckpt_v2_anneal_cosmo/last.pt
+\end{verbatim}}
+
+Numeric outputs backing the tables are committed in
+\texttt{results/paper\_measurements.json} and \texttt{results/graft\_ladder.json}.
+
+\begin{thebibliography}{99}\small
+\bibitem{bert} J.\ Devlin, M.-W.\ Chang, K.\ Lee, K.\ Toutanova.
+\emph{BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.}
+NAACL, 2019.
+\bibitem{albert} Z.\ Lan, M.\ Chen, S.\ Goodman, K.\ Gimpel, P.\ Sharma, R.\ Soricut.
+\emph{ALBERT: A Lite BERT for Self-supervised Learning of Language Representations.}
+ICLR, 2020.
+\bibitem{spanbert} M.\ Joshi, D.\ Chen, Y.\ Liu, D.\ S.\ Weld, L.\ Zettlemoyer, O.\ Levy.
+\emph{SpanBERT: Improving Pre-training by Representing and Predicting Spans.} TACL, 2020.
+\bibitem{net2net} T.\ Chen, I.\ Goodfellow, J.\ Shlens.
+\emph{Net2Net: Accelerating Learning via Knowledge Transfer.} ICLR, 2016.
+\bibitem{stacking} L.\ Gong, D.\ He, Z.\ Li, T.\ Qin, L.\ Wang, T.-Y.\ Liu.
+\emph{Efficient Training of BERT by Progressively Stacking.} ICML, 2019.
+\bibitem{bert2bert} C.\ Chen et al.
+\emph{bert2BERT: Towards Reusable Pretrained Language Models.} ACL, 2022.
+\bibitem{data2vec} A.\ Baevski, W.-N.\ Hsu, Q.\ Xu, A.\ Babu, J.\ Gu, M.\ Auli.
+\emph{data2vec: A General Framework for Self-supervised Learning in Speech, Vision and
+Language.} ICML, 2022.
+\bibitem{kaplan} J.\ Kaplan et al. \emph{Scaling Laws for Neural Language Models.}
+arXiv:2001.08361, 2020.
+\bibitem{chinchilla} J.\ Hoffmann et al.
+\emph{Training Compute-Optimal Large Language Models.} arXiv:2203.15556, 2022.
+\bibitem{induction} C.\ Olsson et al.
+\emph{In-context Learning and Induction Heads.} Transformer Circuits Thread, 2022.
+\bibitem{sbert} N.\ Reimers, I.\ Gurevych.
+\emph{Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks.} EMNLP, 2019.
+\bibitem{tinystories} R.\ Eldan, Y.\ Li.
+\emph{TinyStories: How Small Can Language Models Be and Still Speak Coherent English?}
+arXiv:2305.07759, 2023.
+\bibitem{cosmopedia} L.\ Ben Allal, A.\ Lozhkov, G.\ Penedo, T.\ Wolf, L.\ von Werra.
+\emph{Cosmopedia.} Hugging Face, 2024.
+\bibitem{minicpm} S.\ Hu et al.
+\emph{MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training
+Strategies.} arXiv:2404.06395, 2024. (Warmup--Stable--Decay schedule.)
+\end{thebibliography}
+
+\end{document}

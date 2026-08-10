@@ -28,8 +28,27 @@ env/
 # HF datasets materialised on disk.
 /datasets/
 # Run logs and the pre-refactor code snapshot.
-/logs/
+# Ignore the CONTENTS, not the directory: git does not descend into an excluded
+# directory, so a negation inside `/logs/` could never re-include anything.
+/logs/*
+# ...except the diagnostic time-series. These are ~215 KB total and are the evidence
+# behind the report's tables (ablation cost, FFN slack, attention health per step).
+# They cannot be regenerated without re-running the training they were measured during.
+!/logs/*.jsonl
 
 # checkpoints/ is NOT ignored wholesale: the *.pt rule above drops the weights
 # while keeping each run's metrics.jsonl, which is the training history and only
 # a few hundred KB.
+
+# LaTeX build artifacts. report.pdf IS committed -- it is a deliverable, and the
+# reader should not need a TeX toolchain to read the report.
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.xdv
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz

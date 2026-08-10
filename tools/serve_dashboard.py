@@ -190,14 +190,28 @@ async function renderRun(run, active){
   if(timed.length>=2){const a=timed[timed.length-2],b=timed[timed.length-1];const d=(b.step-a.step)/(b.time-a.time);
     if(d>0){rate=d*60;const rem=(maxs-b.step)/d;eta=rem>3600?(rem/3600).toFixed(1)+'h':Math.max(0,Math.round(rem/60))+'m';}}
   const pct=100*cur.step/maxs;
+  // JEPA runs log collapse telemetry; MLM runs don't. Show the extra panels only there.
+  const jepa = ev.length>0 && ev[ev.length-1].eff_rank!=null;
+  // Runs carrying a grafted layer log per-layer health so the recovery is watchable
+  // while it happens. ENT_MAX = log(seq_len) is the uniform-attention ceiling: a head
+  // sitting there is averaging, not selecting.
+  const graft = ev.length>0 && ev[ev.length-1].l4_np!=null;
+  const PL = (meta.probe_layers&&meta.probe_layers.length)?meta.probe_layers:[4,5];
+  const ENT_MAX = Math.log(meta.seq_len||128);
+  const GC = ['var(--accent)','var(--accent2)','var(--warn)','var(--good)'];
   document.getElementById('view').innerHTML=
     `<div class="sub" style="margin-bottom:10px">${run} <span class="pill ${pill[1]}">${pill[0]}</span> · `+
     `${meta.dataset||'?'} · ${meta.params_M||'?'}M params · eff batch ${meta.eff_batch||'?'}</div>`+
     `<div class="tiles">
        <div class="tile"><div class="k">step</div><div class="v">${cur.step} / ${maxs}</div><div class="bar"><i style="width:${pct}%"></i></div></div>`+
        tile('train loss',fmt(cur.loss))+tile('val loss',fmt(lastEv.val_loss))+
-       tile('masked acc',lastEv.masked_acc!=null?(100*lastEv.masked_acc).toFixed(1)+'%':'–')+
+       tile(jepa?'cos(pred,tgt)':'masked acc',lastEv.masked_acc!=null?(100*lastEv.masked_acc).toFixed(1)+'%':'–')+
        tile('lr',cur.lr!=null?cur.lr.toExponential(2):'–')+
+       (jepa?tile('eff rank',fmt(lastEv.eff_rank,1))+tile('target std',fmt(lastEv.target_std))+
+             tile('cos to mean',fmt(lastEv.cos_to_mean)):'')+
+       (graft?PL.map(L=>tile('L'+L+' never+',lastEv['l'+L+'_np']!=null?
+              (100*lastEv['l'+L+'_np']).toFixed(0)+'%':'–')+
+              tile('L'+L+' attn ent',fmt(lastEv['l'+L+'_ent'],2))).join(''):'')+
        tile('tokens seen',cur.tokens?(cur.tokens/1e6).toFixed(0)+'M':'–')+
        tile('steps/min',rate?rate.toFixed(0):'–')+tile('eta',eta)+
     `</div>
@@ -207,16 +221,46 @@ async function renderRun(run, active){
        <div class="card"><h2>masked-token accuracy vs step</h2><svg id="c2" viewBox="0 0 ${W} ${H}"></svg>
          <div class="lgd"><span class="dot2" style="background:var(--good)"></span>masked_acc</div></div>
        <div class="card"><h2>learning rate vs step</h2><svg id="c3" viewBox="0 0 ${W} ${H}"></svg>
-         <div class="lgd"><span class="dot2" style="background:var(--warn)"></span>lr</div></div>
-     </div>`;
+         <div class="lgd"><span class="dot2" style="background:var(--warn)"></span>lr`+
+         (tr.some(p=>p.lr_boost!=null)?`<span class="dot2" style="background:var(--accent2)"></span>lr (grafted layers)`:'')+
+        `</div></div>`+
+       (graft?`<div class="card"><h2>grafted layers — FFN never-positive</h2><svg id="c6" viewBox="0 0 ${W} ${H}"></svg>
+         <div class="lgd">`+PL.map((L,i)=>`<span class="dot2" style="background:${GC[i%4]}"></span>L${L}`).join('')+
+        ` &nbsp;1.0 = the whole FFN is switched off</div></div>
+       <div class="card"><h2>grafted layers — attention entropy</h2><svg id="c7" viewBox="0 0 ${W} ${H}"></svg>
+         <div class="lgd">`+PL.map((L,i)=>`<span class="dot2" style="background:${GC[i%4]}"></span>L${L}`).join('')+
+        ` &nbsp;${ENT_MAX.toFixed(2)} = uniform, i.e. averaging not selecting</div></div>`:'')+
+       (jepa?`<div class="card"><h2>collapse watch — effective rank</h2><svg id="c4" viewBox="0 0 ${W} ${H}"></svg>
+         <div class="lgd"><span class="dot2" style="background:var(--accent)"></span>eff_rank (falling = collapsing)</div></div>
+       <div class="card"><h2>collapse watch — spread</h2><svg id="c5" viewBox="0 0 ${W} ${H}"></svg>
+         <div class="lgd"><span class="dot2" style="background:var(--good)"></span>target_std<span class="dot2" style="background:var(--accent2)"></span>cos_to_mean (→1 = collapsing)</div></div>`:'')+
+     `</div>`;
   draw(document.getElementById('c1'),
     [{color:'var(--accent)',data:tr.map(p=>({x:p.step,y:p.loss}))},
      {color:'var(--accent2)',data:ev.map(p=>({x:p.step,y:p.val_loss}))}], maxs, null);
   draw(document.getElementById('c2'),
     [{color:'var(--good)',data:ev.map(p=>({x:p.step,y:p.masked_acc}))}], maxs, [0,1]);
   // LR spans warmup->0, so pin the floor at 0 to keep the cosine shape readable.
+  if(jepa){
+    draw(document.getElementById('c4'),
+      [{color:'var(--accent)',data:ev.filter(p=>p.eff_rank!=null).map(p=>({x:p.step,y:p.eff_rank}))}], maxs, null);
+    draw(document.getElementById('c5'),
+      [{color:'var(--good)',data:ev.filter(p=>p.target_std!=null).map(p=>({x:p.step,y:p.target_std}))},
+       {color:'var(--accent2)',data:ev.filter(p=>p.cos_to_mean!=null).map(p=>({x:p.step,y:p.cos_to_mean}))}], maxs, [0,1]);
+  }
+  if(graft){
+    draw(document.getElementById('c6'),
+      PL.map((L,i)=>({color:GC[i%4],
+        data:ev.filter(p=>p['l'+L+'_np']!=null).map(p=>({x:p.step,y:p['l'+L+'_np']}))})),
+      maxs, [0,1]);
+    draw(document.getElementById('c7'),
+      PL.map((L,i)=>({color:GC[i%4],
+        data:ev.filter(p=>p['l'+L+'_ent']!=null).map(p=>({x:p.step,y:p['l'+L+'_ent']}))})),
+      maxs, [0,ENT_MAX]);
+  }
   draw(document.getElementById('c3'),
-    [{color:'var(--warn)',data:tr.filter(p=>p.lr!=null).map(p=>({x:p.step,y:p.lr}))}],
+    [{color:'var(--warn)',data:tr.filter(p=>p.lr!=null).map(p=>({x:p.step,y:p.lr}))},
+     {color:'var(--accent2)',data:tr.filter(p=>p.lr_boost!=null).map(p=>({x:p.step,y:p.lr_boost}))}],
     maxs, [0, Math.max(...tr.map(p=>p.lr||0), 1e-12)]);
 }
 async function renderPrep(){

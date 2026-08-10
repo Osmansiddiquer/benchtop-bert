@@ -1,0 +1,169 @@
+{
+  "_about": "Measurements underlying paper/report.pdf. All MLM numbers use the fixed held-out protocol: tail 1% of each Phase-A corpus, token-weighted 55/35/10, identical RNG seed (1234), unshuffled loader, 15 batches of 16x128, scattered masking unless noted. Eval noise ~ +/-0.05 nats.",
+  "cross_model_mlm": {
+    "_produced_by": "tools/span_eval.py --ckpt <each> --baseline '' --device cuda",
+    "_columns": [
+      "step",
+      "arch",
+      "scat_loss",
+      "scat_acc",
+      "span_loss",
+      "span_acc"
+    ],
+    "ckpt": [
+      8800,
+      "4L/3072",
+      5.9866,
+      0.2531,
+      6.9932,
+      0.1695
+    ],
+    "ckpt2": [
+      20789,
+      "4L/3072",
+      3.0389,
+      0.4819,
+      4.9318,
+      0.2884
+    ],
+    "ckpt3": [
+      12964,
+      "4L/3072",
+      2.7089,
+      0.5295,
+      4.6408,
+      0.3118
+    ],
+    "ckpt_v2_init": [
+      0,
+      "6L/1792",
+      8.2635,
+      0.0125,
+      8.4851,
+      0.0075
+    ],
+    "ckpt_v2@14200": [
+      14200,
+      "6L/1792",
+      2.3828,
+      0.5661,
+      4.0408,
+      0.3588
+    ],
+    "ckpt_v2@18400": [
+      18400,
+      "6L/1792",
+      2.328,
+      0.5759,
+      3.9809,
+      0.3671
+    ],
+    "ckpt_v2_l4only": [
+      18800,
+      "6L/1792",
+      2.3136,
+      0.5781,
+      3.9658,
+      0.3695
+    ],
+    "ckpt_v2_anneal_cosmo": [
+      4000,
+      "6L/1792",
+      2.2738,
+      0.5759,
+      3.9135,
+      0.3789
+    ],
+    "ckpt_jepa (INVALID: no MLM head trained)": [
+      15258,
+      "4L/3072",
+      11.9755,
+      0.0739,
+      13.3518,
+      0.0504
+    ]
+  },
+  "per_corpus_retention": {
+    "_about": "Held-out scattered MLM loss per corpus. Each column is a separate held-out split, so columns are comparable only down, not across. IMDB is the negative control: it was dropped to 0% replay in the v2 mixture.",
+    "_replay_weight_in_v2_mix": {
+      "cosmopedia": 0.55,
+      "ultrafineweb_en": 0.35,
+      "tinystories": 0.1,
+      "imdb": 0.0
+    },
+    "_columns": [
+      "ultrafineweb_en",
+      "tinystories",
+      "imdb",
+      "cosmopedia"
+    ],
+    "ckpt (WikiText only)": [
+      5.966,
+      5.4163,
+      6.0371,
+      6.3295
+    ],
+    "ckpt2 (+UFW)": [
+      2.8882,
+      2.4936,
+      3.8784,
+      3.4847
+    ],
+    "ckpt3 (+TinyStories+IMDB, replay)": [
+      2.9511,
+      1.0227,
+      2.9255,
+      3.1006
+    ],
+    "ckpt_v2 (+Cosmopedia, replay)": [
+      3.2132,
+      1.2459,
+      3.8733,
+      2.2875
+    ],
+    "ckpt_v2_anneal_cosmo (final)": [
+      3.3605,
+      1.343,
+      3.9433,
+      2.1129
+    ],
+    "delta_ckpt3_to_v2": {
+      "cosmopedia": -0.813,
+      "ultrafineweb_en": 0.262,
+      "tinystories": 0.223,
+      "imdb": 0.948
+    }
+  },
+  "generalisation_gap": {
+    "_about": "ckpt_v2_anneal_cosmo, 40 batches, same mixture, train-range vs held-out.",
+    "train_range": {
+      "loss": 2.1427,
+      "acc": 0.591
+    },
+    "held_out": {
+      "loss": 2.3251,
+      "acc": 0.5787
+    },
+    "gap_nats": 0.1824,
+    "gap_acc_points": -1.23
+  },
+  "eval_mixture_effect": {
+    "_about": "Same checkpoint (ckpt_v2_anneal_cosmo), two evaluation mixtures.",
+    "cosmopedia_only_what_the_run_logged": 2.0487,
+    "phase_a_mix_55_35_10": 2.2738,
+    "difference_nats": 0.2251
+  },
+  "step_time": {
+    "_about": "Median s/step from metrics.jsonl, gaps >120s (laptop sleep) excluded.",
+    "v2_joint_all_params": 1.397,
+    "v2_l4only_frozen_stack": 0.858,
+    "speedup": 1.63,
+    "trainable_param_fraction": 0.127
+  },
+  "compute_total": {
+    "gpu_hours": 35.36,
+    "tokens_processed_M": 2994.3,
+    "final_model_lineage_tokens_M": 2178.5,
+    "tokens_per_parameter": 78
+  }
+}

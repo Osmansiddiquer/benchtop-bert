@@ -19,7 +19,7 @@
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
-PY=/home/nimda/miniconda3/bin/python
+PY=${PY:-$(command -v python)}   # override with PY=... under cron, whose PATH is minimal
 LOGDIR=logs
 mkdir -p "$LOGDIR"
 SUPLOG="$LOGDIR/supervisor.log"

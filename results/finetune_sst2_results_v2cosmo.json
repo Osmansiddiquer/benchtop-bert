@@ -1,0 +1,20 @@
+{
+  "backbone": "checkpoints/ckpt_v2_cosmo_imdb/last.pt",
+  "sel_acc_per_epoch": [
+    0.8892188892188893,
+    0.9138699138699139,
+    0.9156519156519156
+  ],
+  "best_sel_acc": 0.9212949212949213,
+  "best_step": 4600,
+  "val_acc": 0.8600917431192661,
+  "val_loss": 0.5401246462549482,
+  "val_n": 872,
+  "val_se": 0.011747239405227313,
+  "epochs": 3,
+  "lr": 3e-05,
+  "llrd": 1.0,
+  "batch": 32,
+  "checkpoint": "checkpoints/ckpt_sst2_v2cosmo/best.pt",
+  "complete": true
+}

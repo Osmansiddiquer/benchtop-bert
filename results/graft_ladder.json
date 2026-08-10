@@ -1,0 +1,83 @@
+{
+  "ckpt": "checkpoints/ckpt3/last.pt",
+  "batches": 15,
+  "rows": [
+    {
+      "variant": "ckpt3 4L/3072 ReLU (source)",
+      "n_layers": 4,
+      "d_ff": 3072,
+      "scat_loss": 2.708900054295858,
+      "scat_acc": 0.5294762217839141,
+      "delta_vs_ref": null
+    },
+    {
+      "variant": "GELU swap only, 4L  [REFERENCE]",
+      "n_layers": 4,
+      "d_ff": 3072,
+      "scat_loss": 2.9775739192962645,
+      "scat_acc": 0.4983563445101907,
+      "delta_vs_ref": 0.0
+    },
+    {
+      "variant": "+1 block, copy-stacked",
+      "n_layers": 5,
+      "d_ff": 3072,
+      "scat_loss": 8.548776880900066,
+      "scat_acc": 0.015121630506245891,
+      "delta_vs_ref": 5.5712029616038015
+    },
+    {
+      "variant": "+1 block, FFN_out=0, LN copied",
+      "n_layers": 5,
+      "d_ff": 3072,
+      "scat_loss": 7.7290362358093265,
+      "scat_acc": 0.07538899846592154,
+      "delta_vs_ref": 4.751462316513062
+    },
+    {
+      "variant": "+1 block, W_O=0 FFN_out=0, LN copied",
+      "n_layers": 5,
+      "d_ff": 3072,
+      "scat_loss": 7.101602204640707,
+      "scat_acc": 0.08174446635985097,
+      "delta_vs_ref": 4.124028285344442
+    },
+    {
+      "variant": "+1 block, W_O=0 FFN_out=0, LN reset",
+      "n_layers": 5,
+      "d_ff": 3072,
+      "scat_loss": 2.9775671641031902,
+      "scat_acc": 0.4983563445101907,
+      "delta_vs_ref": -6.755193074248211e-06
+    },
+    {
+      "variant": "fully-neutral graft inserted at position 0",
+      "n_layers": 5,
+      "d_ff": 3072,
+      "scat_loss": 3.064633337656657,
+      "scat_acc": 0.4904667981591059,
+      "delta_vs_ref": 0.08705941836039255
+    },
+    {
+      "variant": "fully-neutral graft inserted at position 2",
+      "n_layers": 5,
+      "d_ff": 3072,
+      "scat_loss": 3.202100721995036,
+      "scat_acc": 0.4724961648038571,
+      "delta_vs_ref": 0.22452680269877145
+    },
+    {
+      "variant": "fully-neutral graft inserted at position 4",
+      "n_layers": 5,
+      "d_ff": 3072,
+      "scat_loss": 2.9775671641031902,
+      "scat_acc": 0.4983563445101907,
+      "delta_vs_ref": -6.755193074248211e-06
+    }
+  ],
+  "logit_check": {
+    "LN reset to (1,0)": 0.0012693405151367188,
+    "LN copied from donor": 37.734195709228516
+  },
+  "mean_logit": 3.820664644241333
+}

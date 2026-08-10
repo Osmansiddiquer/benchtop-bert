@@ -7,6 +7,8 @@ we corrupt a fraction of the input and ask the model to reconstruct the original
 from both-sided context.
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -15,6 +17,57 @@ from mini_enc_transformer.model.encoder import Encoder
 
 # torch.nn.functional.cross_entropy ignores targets equal to this by default.
 IGNORE_INDEX = -100
+
+
+def _select_spans(input_ids, protected, mlm_probability, span_min, span_max, generator,
+                  dist="uniform", geom_p=0.2):
+    """Select ~`mlm_probability` of positions as contiguous spans.
+
+    SpanBERT-style (Joshi et al. 2020). Scattered single-token masking is often
+    solvable from immediate neighbours -- local morphology and collocations give the
+    answer away. Masking a whole span removes that crutch and forces longer-range
+    context. The *budget* is identical to random masking (same fraction of tokens
+    scored), so the two differ only in how the masked positions are arranged.
+
+    dist="geometric" reproduces SpanBERT's actual sampler: l ~ Geo(p), clipped to
+    [span_min, span_max]. With p=0.2 and a clip of 10 the mean is ~3.8. The point is
+    the long tail -- uniform 2..4 never produces a genuinely hard case, whereas the
+    geometric occasionally masks 8-10 contiguous tokens, which is what forces
+    long-range inference rather than local smoothing.
+    """
+    B, T = input_ids.shape
+    selected = torch.zeros_like(input_ids, dtype=torch.bool)
+    budget = int(round(mlm_probability * T))
+    if budget == 0:
+        return selected
+    if dist == "geometric":
+        # inverse-CDF sample of a geometric on {1,2,...}, then clip into range
+        u = torch.rand((B, budget), generator=generator, device=input_ids.device)
+        g = torch.floor(torch.log1p(-u) / math.log1p(-geom_p)) + 1
+        lengths = g.clamp(span_min, span_max).long()
+    else:
+        lengths = torch.randint(span_min, span_max + 1, (B, budget), generator=generator,
+                                device=input_ids.device)
+    starts = torch.randint(0, T, (B, budget), generator=generator, device=input_ids.device)
+    for b in range(B):
+        placed, attempt = 0, 0
+        # Cap attempts: once the sequence is crowded, random starts mostly collide.
+        while placed < budget and attempt < budget * 4:
+            i = attempt % budget
+            s = int(starts[b, i])
+            L = int(lengths[b, i])
+            e = min(s + L, T)
+            window = selected[b, s:e] | protected[b, s:e]
+            if window.any():                      # overlaps an existing span or a special token
+                attempt += 1
+                starts[b, i] = torch.randint(0, T, (1,), generator=generator,
+                                             device=input_ids.device)[0]
+                continue
+            take = min(e - s, budget - placed)    # never exceed the token budget
+            selected[b, s:s + take] = True
+            placed += take
+            attempt += 1
+    return selected
 
 
 def mask_tokens(
@@ -27,6 +80,10 @@ def mask_tokens(
     mask_prob: float = 0.8,
     random_prob: float = 0.1,
     generator: torch.Generator = None,
+    span_min: int = 1,
+    span_max: int = 1,
+    span_dist: str = "uniform",
+    geom_p: float = 0.2,
 ):
     """Apply BERT's 80/10/10 masking to a batch of token ids.
 
@@ -56,9 +113,13 @@ def mask_tokens(
     if pad_token_id is not None:
         protected |= input_ids == pad_token_id
 
-    prob_matrix = torch.full(input_ids.shape, mlm_probability, device=device)
-    prob_matrix.masked_fill_(protected, 0.0)
-    selected = torch.bernoulli(prob_matrix, generator=generator).bool()
+    if span_max > 1:
+        selected = _select_spans(input_ids, protected, mlm_probability,
+                                 span_min, span_max, generator, span_dist, geom_p)
+    else:
+        prob_matrix = torch.full(input_ids.shape, mlm_probability, device=device)
+        prob_matrix.masked_fill_(protected, 0.0)
+        selected = torch.bernoulli(prob_matrix, generator=generator).bool()
 
     # Positions we don't score contribute nothing to the loss.
     labels[~selected] = IGNORE_INDEX

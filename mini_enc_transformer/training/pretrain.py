@@ -49,11 +49,31 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-frac", type=float, default=0.06)
+    p.add_argument("--schedule", choices=["cosine", "wsd"], default="cosine",
+                   help="cosine decays to 0 (a continuation then needs a re-warm); "
+                        "wsd holds the peak flat and decays only at the end, so the "
+                        "run stays extendable")
+    p.add_argument("--decay-frac", type=float, default=0.30,
+                   help="wsd only: final fraction of steps spent decaying to 0")
     p.add_argument("--max-steps", type=int, default=10000)  # optimizer steps (sets cosine horizon)
     p.add_argument("--max-seconds", type=float, default=None,
                    help="wall-clock training budget; stops + checkpoints when reached")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--mlm-prob", type=float, default=0.15)
+    # SpanBERT-style span masking. span-max 1 == standard scattered BERT masking.
+    # The masked *budget* is identical either way; only the arrangement changes.
+    p.add_argument("--mask-span-min", type=int, default=1)
+    p.add_argument("--mask-span-dist", choices=["uniform", "geometric"], default="uniform",
+                   help="geometric reproduces SpanBERT's sampler (mean ~3.8 with a long "
+                        "tail); uniform never produces a genuinely hard long span")
+    p.add_argument("--mask-geom-p", type=float, default=0.2)
+    p.add_argument("--mask-span-max", type=int, default=1)
+    p.add_argument("--eval-span-min", type=int, default=None,
+                   help="masking used at eval time; defaults to the training spans. "
+                        "Set explicitly to score two differently-trained models under "
+                        "one identical scheme -- span prediction is strictly harder, so "
+                        "accuracies from different schemes are not comparable.")
+    p.add_argument("--eval-span-max", type=int, default=None)
     # infra
     p.add_argument("--ckpt-dir", default="ckpt")
     p.add_argument("--ckpt-every", type=int, default=200)
@@ -110,6 +130,21 @@ def lr_lambda(step, warmup, total):
     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))  # cosine -> 0
 
 
+def wsd_lambda(step, warmup, total, decay_frac):
+    """Warmup-Stable-Decay (MiniCPM 2024): ramp, hold at peak, decay only at the end.
+
+    Unlike cosine-to-zero this leaves the run extendable -- you can stop after the
+    stable phase and continue without paying a re-warm spike, the tax phases 2 and 3
+    of this project each paid.
+    """
+    decay = int(decay_frac * total)
+    if step < warmup:
+        return step / max(1, warmup)
+    if step < total - decay:
+        return 1.0
+    return max(0.0, (total - step) / max(1, decay))
+
+
 def atomic_save(obj, path):
     tmp = path + ".tmp"
     torch.save(obj, tmp)
@@ -124,8 +159,16 @@ def append_metric(path, obj):
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, ids, device, max_batches=20):
+def evaluate(model, val_loader, ids, device, max_batches=20, span_min=1, span_max=1,
+             seed=1234):
+    """Masked-token loss/accuracy on held-out blocks.
+
+    The masking RNG is seeded per call, so every eval scores the same corrupted
+    positions. Without that, run-to-run differences partly reflect which tokens
+    happened to be masked rather than model quality.
+    """
     model.eval()
+    g = torch.Generator().manual_seed(seed)
     tot_loss, tot_correct, tot_scored = 0.0, 0, 0
     n = 0
     for block in val_loader:
@@ -133,7 +176,8 @@ def evaluate(model, val_loader, ids, device, max_batches=20):
             break
         n += 1
         masked, labels = mask_tokens(block, ids["mask_id"], ids["vocab_size"],
-                                     special_token_ids=ids["special_ids"], pad_token_id=ids["pad_id"])
+                                     special_token_ids=ids["special_ids"], pad_token_id=ids["pad_id"],
+                                     generator=g, span_min=span_min, span_max=span_max)
         masked, labels = masked.to(device), labels.to(device)
         out = model(masked, labels)
         tot_loss += out["loss"].item()
@@ -155,7 +199,10 @@ def train(cfg):
     model = build_model(cfg, ids).to(device)
     opt = make_optimizer(model, cfg.lr, cfg.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: lr_lambda(s, int(cfg.warmup_frac * cfg.max_steps), cfg.max_steps))
+        opt, (lambda s: lr_lambda(s, int(cfg.warmup_frac * cfg.max_steps), cfg.max_steps))
+        if cfg.schedule == "cosine" else
+        (lambda s: wsd_lambda(s, int(cfg.warmup_frac * cfg.max_steps), cfg.max_steps,
+                              cfg.decay_frac)))
 
     def build_ds(split):
         """Spec: 'name' | 'a:w,b:w' | 'a:w:limit,b:w:limit'.
@@ -217,7 +264,10 @@ def train(cfg):
                                  "start_step": start_step, "params_M": round(n_params / 1e6, 1),
                                  "eff_batch": cfg.micro_batch * cfg.grad_accum,
                                  "tokens_per_step": tokens_per_step, "vocab": ids["vocab_size"],
-                                 "dataset": cfg.data_name, "lr": cfg.lr, "time": time.time()})
+                                 "dataset": cfg.data_name, "lr": cfg.lr,
+                                 "seq_len": cfg.seq_len, "schedule": cfg.schedule,
+                                 "span": [cfg.mask_span_min, cfg.mask_span_max],
+                                 "time": time.time()})
 
     def save_ckpt():
         atomic_save({"model": model.state_dict(), "opt": opt.state_dict(),
@@ -243,7 +293,9 @@ def train(cfg):
             block = next(data_iter)
 
         masked, labels = mask_tokens(block, ids["mask_id"], ids["vocab_size"],
-                                     special_token_ids=ids["special_ids"], pad_token_id=ids["pad_id"])
+                                     special_token_ids=ids["special_ids"], pad_token_id=ids["pad_id"],
+                                     span_min=cfg.mask_span_min, span_max=cfg.mask_span_max,
+                                     span_dist=cfg.mask_span_dist, geom_p=cfg.mask_geom_p)
         masked, labels = masked.to(device), labels.to(device)
 
         if use_amp:
@@ -273,7 +325,9 @@ def train(cfg):
                                              "lr": lr_now, "tokens": step * tokens_per_step,
                                              "time": time.time()})
             if step % cfg.eval_every == 0:
-                vl, va = evaluate(model, val_loader, ids, device)
+                vl, va = evaluate(model, val_loader, ids, device,
+                                  span_min=cfg.eval_span_min if cfg.eval_span_min else cfg.mask_span_min,
+                                  span_max=cfg.eval_span_max if cfg.eval_span_max else cfg.mask_span_max)
                 print(f"  [eval] step {step} | val_loss {vl:.3f} | masked_acc {va:.3f}", flush=True)
                 append_metric(metrics_path, {"t": "eval", "step": step, "val_loss": round(vl, 4),
                                              "masked_acc": round(va, 4), "time": time.time()})

@@ -1,4 +1,11 @@
 """Before/after comparison for the continuation fine-tune (greedy, identical prompts)."""
+import os
+import sys
+
+# Run as `python tools/x.py` from the repo root: sys.path[0] is tools/, so the
+# package at the repo root is not importable without this.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 from mini_enc_transformer.training.pretrain import build_tokenizer, build_model
 

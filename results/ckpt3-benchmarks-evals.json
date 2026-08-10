@@ -1,0 +1,66 @@
+{
+  "ckpt": "checkpoints/ckpt3/last.pt",
+  "results": [
+    {
+      "task": "stsb",
+      "mode": "zero-shot-cosine",
+      "pearson": 0.540255606174469,
+      "spearman": 0.5609936118125916,
+      "se": 0.017711512412132924,
+      "primary": 0.5609936118125916,
+      "metric": "spearman",
+      "n_dev": 1500
+    },
+    {
+      "accuracy": 0.7740825414657593,
+      "se": 0.01416153371739727,
+      "primary": 0.7740825414657593,
+      "metric": "accuracy",
+      "mode": "probe",
+      "task": "sst2",
+      "n_dev": 872,
+      "sel_best": 0.7493317723274231,
+      "epochs": 8,
+      "lr": 0.001
+    },
+    {
+      "accuracy": 0.8509174585342407,
+      "se": 0.012061431884348049,
+      "primary": 0.8509174585342407,
+      "metric": "accuracy",
+      "mode": "finetune",
+      "task": "sst2",
+      "n_dev": 872,
+      "sel_best": 0.9129788875579834,
+      "epochs": 3,
+      "lr": 3e-05
+    },
+    {
+      "pearson": 0.5878925919532776,
+      "spearman": 0.5971120595932007,
+      "se": 0.01663088924570033,
+      "primary": 0.5971120595932007,
+      "metric": "spearman",
+      "mode": "probe",
+      "task": "stsb",
+      "n_dev": 1500,
+      "sel_best": 0.5450966358184814,
+      "epochs": 8,
+      "lr": 0.001
+    },
+    {
+      "pearson": 0.4312860369682312,
+      "spearman": 0.4198969006538391,
+      "se": 0.021286562738638437,
+      "primary": 0.4198969006538391,
+      "metric": "spearman",
+      "mode": "finetune",
+      "task": "stsb",
+      "n_dev": 1500,
+      "sel_best": 0.4679938554763794,
+      "epochs": 3,
+      "lr": 3e-05
+    }
+  ],
+  "minutes": 13.2
+}
