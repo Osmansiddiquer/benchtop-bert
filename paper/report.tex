@@ -19,6 +19,8 @@
 \titleformat{\section}{\normalfont\large\bfseries}{\thesection}{0.7em}{}
 \titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{0.7em}{}
 \setlist{itemsep=2pt,topsep=3pt,parsep=0pt}
+% let TeX relax a little on the few paragraphs with long \texttt{} runs
+\setlength{\emergencystretch}{2em}
 
 \newcommand{\dff}{\texttt{d\_ff}}
 \newcommand{\dmodel}{\texttt{d\_model}}
@@ -29,7 +31,7 @@
 \large A 28M-parameter encoder under a hard parameter cap:\\
 what two weeks of laptop-scale experiments established}
 
-\author{osmansiddiquer\\\small\texttt{transformer-v1}}
+\author{osmansiddiquer\\\small\texttt{benchtop-bert}}
 \date{August 2026}
 
 \begin{document}
@@ -57,6 +59,12 @@ LayerNorm affine parameters must be \emph{reset} to $(\gamma{=}1,\beta{=}0)$ rat
 from the donor layer. Copying them costs \nats{{+}4.12}; resetting them costs
 \nats{0.000} (max $|\Delta\text{logit}| = 1.3\times10^{-3}$ against a mean logit magnitude of
 3.82). Inserting the same block mid-stack costs \nats{{+}0.23} regardless.
+
+A second contribution is methodological: a pattern for pulling \textbf{continuous
+internal-health telemetry off a live training run at approximately zero marginal GPU cost}
+(\S\ref{sec:zerocost})---atomic checkpoints so the run is readable from outside, scoring on the
+idle device (8.9--22.2\,s on CPU against 13.2--16.6 minutes of exclusive GPU for a downstream
+evaluation), and streaming the already-free per-layer signals straight into the training log.
 
 We further show that a sixth layer at this scale has no work to do under three independent
 initialisations; that single-layer ablation cost over-attributes, with
@@ -86,8 +94,10 @@ the chronology. Section~\ref{sec:setup} gives the setup and the evaluation proto
 turned out to matter more than most of the interventions. Section~\ref{sec:worked} reports the
 components that demonstrably worked, with controls. Section~\ref{sec:graft} is the main
 technical contribution: a measured, corrected recipe for function-preserving layer grafting in
-post-LN transformers. Sections~\ref{sec:depth}--\ref{sec:width} report the negative and
-diagnostic results. Section~\ref{sec:eng} collects engineering findings that cost real time.
+post-LN transformers. Section~\ref{sec:depth} reports the depth result, and
+Section~\ref{sec:diag} the diagnostics---both the zero-cost telemetry pattern that made the
+project observable at all (\S\ref{sec:zerocost}) and the ways the cheap metrics misled.
+Sections~\ref{sec:anneal}--\ref{sec:width} report the remaining results. Section~\ref{sec:eng} collects engineering findings that cost real time.
 Section~\ref{sec:scoreboard} presents the final scoreboard and the project's central negative
 result. Section~\ref{sec:lessons} states what we would do differently.
 
@@ -325,7 +335,9 @@ implemented.
 
 \subsection{The diagnostic tooling}
 
-The tools in \texttt{tools/} are themselves a result. Three earned their cost repeatedly:
+The tools in \texttt{tools/} are themselves a result---arguably the most reusable one, and
+the \emph{pattern} they share is treated as a contribution in its own right in
+\S\ref{sec:zerocost}. Three earned their cost repeatedly:
 \texttt{span\_eval.py} (the fixed-protocol evaluation of \S\ref{sec:protocol}),
 \texttt{layer\_contrib.py} (causal ablation cost, single and pairwise, \S\ref{sec:depth}), and
 \texttt{audit\_eval.py} (which mechanically checks the failure modes of
@@ -525,9 +537,78 @@ downstream layer.} For pruning decisions the pairwise marginal is the number wan
 differ from the single by a factor of two.
 
 %======================================================================
-\section{Diagnostics that mislead}\label{sec:diag}
+\section{Diagnostics: zero-cost telemetry, and what it can and cannot tell you}\label{sec:diag}
 
-We built five diagnostics. Four of them lied at least once, in ways worth cataloguing.
+\subsection{Zero-cost live diagnostics}\label{sec:zerocost}
+
+On a 4\,GB laptop the GPU \emph{is} the training run. Any diagnostic that wants the GPU
+competes with the thing it is diagnosing, and the honest measure of model quality---a
+downstream fine-tune---costs 8.3 minutes of exclusive GPU, with the full benchmark suite at
+13.2--16.6 minutes. At that price it is affordable perhaps twice per run, which means flying
+blind for hours and learning everything in the post-mortem.
+
+The pattern we settled on extracts continuous internal-health telemetry from a live run at
+approximately zero marginal cost. It has three parts, and it is the most transferable piece of
+engineering in this project.
+
+\paragraph{1. Atomic checkpoints make the run readable from outside.} \texttt{atomic\_save}
+writes through \texttt{os.replace}, which is atomic on POSIX. An external process can therefore
+read \texttt{last.pt} at any instant during training and is guaranteed a complete,
+self-consistent checkpoint---never a torn write. This is the load-bearing piece:
+diagnostics need not live \emph{inside} the training process, so they cannot slow it down,
+crash it, or be lost with it.
+
+\paragraph{2. Score on the idle device.} \texttt{span\_eval.py}, \texttt{attn\_health.py} and
+\texttt{ffn\_slack.py} default to CPU precisely so they never contend for VRAM. Measured
+wall-clock on the final checkpoint:
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{5pt}
+\begin{tabular}{llrl}
+\toprule
+diagnostic & device & cost & what it reports \\
+\midrule
+\texttt{ffn\_slack.py}     & CPU & \textbf{8.9\,s}  & slack, never-positive fraction, utilisation \\
+\texttt{attn\_health.py}   & CPU & \textbf{14.8\,s} & per-head entropy, out\_rank, head similarity \\
+\texttt{layer\_contrib.py} & CPU & \textbf{22.2\,s} & causal ablation cost per layer \\
+\emph{SST-2 fine-tune}     & \emph{GPU, exclusive} & \emph{8.3\,min} & \emph{the actual downstream number} \\
+\emph{full benchmark suite}& \emph{GPU, exclusive} & \emph{13.2--16.6\,min} & \emph{SST-2 + STS-B, probe + fine-tune} \\
+\bottomrule
+\end{tabular}
+\caption{Diagnostic cost against evaluation cost. The correlational diagnostics are
+$\approx$60$\times$ cheaper \emph{and} run on a different device, so their marginal cost to the
+training run is essentially zero.}
+\end{table}
+
+We ran these on a 20-minute loop for the entire project, accumulating $\approx$100 readings per
+metric across 35 GPU-hours. That cadence is what made trends legible. Individual readings are
+noisy enough that layer 4's trajectory was mis-called repeatedly from single
+cycles---``converged'', then ``accelerating'', then ``regression'', all wrong. The fix was
+fitted slopes over multi-cycle windows, and those windows exist only because each reading cost
+nine seconds of idle CPU rather than a quarter-hour of the GPU.
+
+\paragraph{3. Stream the already-free signals into the training log itself.}
+\texttt{layer\_probe} runs one extra forward pass on the eval batch that is already resident,
+materialising attention probabilities only for the named layers, and writes
+\texttt{l4\_ent}, \texttt{l4\_np}, \texttt{l5\_ent}, \texttt{l5\_np} into
+\texttt{metrics.jsonl} next to the loss. The dashboard (\texttt{tools/serve\_dashboard.py},
+standard library only, no dependencies) plots them live. Per-layer health stops being a
+post-mortem and becomes a curve one watches.
+
+This is what made the layer-4 graft legible while it was happening. Attention entropy near
+$\log T = 4.85$ means a head is averaging rather than selecting; \texttt{never\_pos} near 1
+means the FFN is switched off. Watching \texttt{l4\_ent} sit at 3.9 said within minutes---not
+hours---that the fresh layer was not differentiating.
+
+\paragraph{The transferable rule.} Make the run readable from outside (atomic writes), score on
+whichever device is idle, and stream into the log only those signals that are already
+nearly free. On constrained hardware this turns ``I will find out in the post-mortem'' into a
+live feed, for approximately nothing.
+
+One caveat, which the rest of this section is about: everything above concerns \textbf{delivery},
+not \textbf{validity}. Cheap telemetry is not free of interpretation risk, and three of these
+near-free metrics were actively misleading until their nulls were measured. The one diagnostic
+that never lied is also the one that needs a real forward pass per layer.
 
 \subsection{Head similarity had a null of $\approx$0.97, not 0}
 
@@ -847,6 +928,7 @@ is qualitative.
 \item \textbf{Measure every proxy metric's null on an untrained model before trusting it once.}
 The head-similarity metric read 0.97 at random initialisation. Ten minutes of work would have
 caught it; instead it invalidated a week of readings.
+\item \textbf{Build the zero-cost telemetry loop first} (\S\ref{sec:zerocost}). Atomic checkpoints plus CPU-side scoring cost a day and made every later experiment observable while it ran.
 \item \textbf{Prefer causal metrics.} Ablation cost was $\approx$40$\times$ more expensive per
 reading and the only diagnostic never retracted. Budget for it.
 \item \textbf{Use pairwise marginals, not singles, for pruning decisions.}

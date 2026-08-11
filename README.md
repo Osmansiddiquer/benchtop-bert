@@ -1,9 +1,11 @@
-# transformer-v1 — a from-scratch BERT-style encoder (laptop-scale)
+# benchtop-bert — a from-scratch BERT-style encoder (laptop-scale)
 
 An encoder-only transformer — attention, blocks, embeddings, MLM head — written from scratch
 and pretrained on a single 4 GB laptop GPU (RTX 3050 Ti), under a hard **30M parameter cap**,
 then fine-tuned for sentiment. Every component is hand-rolled; only the tokenizer is borrowed
 (`allenai/OLMo-1B-hf`, plus an added `[MASK]`).
+
+*Benchtop* as in benchtop instrument: small enough to sit on a desk, built to be measured with.
 
 **Status: closed.** Final model `ckpt_v2_anneal_cosmo` — 27.952M params, 6 layers, `d_ff` 1792,
 GELU. **SST-2 dev 85–86%** (BERT-base ≈ 92.7% at 110M params). Total cost: **35.4 GPU-hours**,
@@ -50,6 +52,12 @@ The remaining ~7pp gap to BERT-base is **capacity**, not allocation.
 
 Each is measured, not asserted; §-numbers point into the report.
 
+- **Zero-cost live diagnostics.** Atomic checkpoints (`os.replace`) make a running job
+  readable from outside; scoring on the idle CPU costs **8.9–22.2 s** against **13.2–16.6 min
+  of exclusive GPU** for a downstream eval; and the already-free per-layer signals stream
+  straight into `metrics.jsonl` for live plotting. ~60× cheaper, on a different device, so the
+  marginal cost to training is ~zero — which is what made a 20-minute monitoring cadence
+  affordable across 35 GPU-hours. §6.1
 - **Replay floor, not replay fraction.** 10% replay retained as well as 35%; **0% cost four
   times as much** (0.95 nats vs ~0.25). The same measurement shows annealing *specialises*
   rather than uniformly improving: the Cosmopedia anneal gained 0.175 nats on Cosmopedia and

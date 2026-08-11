@@ -3,9 +3,9 @@
 **A 28M-parameter encoder under a hard parameter cap: what two weeks of laptop-scale
 experiments established.**
 
-*osmansiddiquer · August 2026 · `transformer-v1`*
+*osmansiddiquer · August 2026 · `benchtop-bert`*
 
-> 📄 **The formal version is [`paper/report.pdf`](paper/report.pdf)** (15 pages, LaTeX source
+> 📄 **The formal version is [`paper/report.pdf`](paper/report.pdf)** (LaTeX source
 > in [`paper/report.tex`](paper/report.tex)). This file is the same content in Markdown for
 > reading on GitHub. Section numbers match.
 
@@ -34,8 +34,15 @@ only in pre-LN architectures. We show it is exact in **post-LN** as well, under 
 that are not usually stated: the block must be appended at the **top** of the stack, and its
 LayerNorm affine parameters must be **reset** to (γ=1, β=0) rather than copied from the donor
 layer. Copying them costs **+4.12 nats**; resetting them costs **0.000** (max |Δlogit| =
-1.4e-3 against a mean logit magnitude of 3.83). Inserting the same block mid-stack costs
+1.3e-3 against a mean logit magnitude of 3.82). Inserting the same block mid-stack costs
 +0.23 nats regardless.
+
+A second contribution is methodological: a pattern for pulling **continuous internal-health
+telemetry off a live training run at approximately zero marginal GPU cost** (§6.1) — atomic
+checkpoints so the run is readable from outside, scoring on the idle device (8.9–22.2 s on CPU
+against 13.2–16.6 minutes of exclusive GPU for a downstream evaluation), and streaming the
+already-free per-layer signals straight into the training log. On a machine where the GPU *is*
+the training run, this is the difference between a live feed and a post-mortem.
 
 We further show that a sixth layer at this scale has no work to do under three independent
 initialisations (§5); that single-layer ablation cost over-attributes, with
@@ -228,10 +235,15 @@ context sampling from length 1), not implemented.
 
 ### 3.6 The diagnostic tooling
 
-The tools in `tools/` are themselves a result. Three earned their cost repeatedly:
-`span_eval.py` (the fixed-protocol evaluation of §2.4), `layer_contrib.py` (causal ablation
-cost, single and pairwise, §5), and `audit_eval.py` (which mechanically checks the failure
-modes of §8). Each converted a recurring argument into a number.
+The tools in `tools/` are themselves a result — arguably the most reusable one. Three earned
+their cost repeatedly: `span_eval.py` (the fixed-protocol evaluation of §2.4),
+`layer_contrib.py` (causal ablation cost, single and pairwise, §5), and `audit_eval.py` (which
+mechanically checks the failure modes of §8). Each converted a recurring argument into a number.
+
+More than the individual tools, the *pattern* they share is the contribution: continuous
+internal-health telemetry pulled off a live training run for ~zero marginal GPU cost. That is
+**§6.1**, and it is the part most directly transferable to anyone training on hardware they
+also have to use for something else.
 
 ---
 
@@ -386,11 +398,71 @@ from the single by a factor of two.
 
 ---
 
-## 6. Diagnostics that mislead
+## 6. Diagnostics: zero-cost telemetry, and what it can and cannot tell you
 
-We built five diagnostics. Four lied at least once.
+### 6.1 Zero-cost live diagnostics
 
-### 6.1 Head similarity had a null of ~0.97, not 0
+On a 4 GB laptop the GPU *is* the training run. Any diagnostic that wants the GPU competes with
+the thing it is diagnosing, and the honest measure of model quality — a downstream fine-tune —
+costs 8.3 minutes of exclusive GPU, with the full benchmark suite at 13.2–16.6 minutes. At that
+price you can afford it perhaps twice per run, which means flying blind for hours and learning
+everything in the post-mortem.
+
+The pattern we ended up with gets continuous internal-health telemetry out of a live run at
+approximately zero marginal cost. It has three parts, and it is the most transferable piece of
+engineering in this project.
+
+**1. Atomic checkpoints make the run readable from outside.** `atomic_save` writes through
+`os.replace`, which is atomic on POSIX. An external process can therefore read `last.pt` at any
+instant during training and is guaranteed a complete, self-consistent checkpoint — never a torn
+write. This is the load-bearing piece: it means diagnostics do not have to live *inside* the
+training process, so they cannot slow it down, crash it, or be lost with it.
+
+**2. Score on the idle device.** `span_eval.py`, `attn_health.py` and `ffn_slack.py` default to
+CPU precisely so they never contend for VRAM. Measured wall-clock on the final checkpoint:
+
+| diagnostic | device | cost | what it reports |
+|---|---|---|---|
+| `ffn_slack.py` | CPU | **8.9 s** | per-layer slack, never-positive fraction, utilisation, kurtosis |
+| `attn_health.py` | CPU | **14.8 s** | per-head entropy / contribution / offset, out_rank, centred head similarity |
+| `layer_contrib.py` | CPU | **22.2 s** | causal ablation cost per layer |
+| *SST-2 fine-tune* | *GPU, exclusive* | *8.3 min* | *the actual downstream number* |
+| *full benchmark suite* | *GPU, exclusive* | *13.2–16.6 min* | *SST-2 + STS-B, probe + fine-tune* |
+
+The correlational diagnostics are ~60× cheaper than a downstream evaluation and — more
+importantly — run on a **different device**, so their marginal cost to the training run is
+essentially zero. We ran them on a 20-minute loop for the entire project, accumulating ~100
+readings per metric across 35 GPU-hours.
+
+That cadence is what made trends legible. Individual readings are noisy enough that I
+repeatedly mis-called layer 4's trajectory from single cycles — "converged", then
+"accelerating", then "regression", all wrong. The fix was fitted slopes over multi-cycle
+windows, and those windows only exist because each reading cost nine seconds of idle CPU
+instead of a quarter-hour of the GPU.
+
+**3. Stream the already-free signals into the training log itself.** `layer_probe` runs one
+extra forward pass on the eval batch that is already resident, materialising attention
+probabilities only for the named layers, and writes `l4_ent`, `l4_np`, `l5_ent`, `l5_np` into
+`metrics.jsonl` next to the loss. The dashboard (`tools/serve_dashboard.py`, stdlib only, no
+dependencies) plots them live. Per-layer health stops being a post-mortem you run and becomes a
+curve you watch.
+
+This is what made the layer-4 graft legible while it was happening rather than afterwards.
+Attention entropy near `log(T) = 4.85` means a head is averaging rather than selecting;
+`never_pos` near 1 means the FFN is switched off. Watching `l4_ent` sit at 3.9 said within
+minutes — not hours — that the fresh layer was not differentiating.
+
+**The transferable rule: make the run readable from outside (atomic writes), score on whichever
+device is idle, and stream into the log only the signals that are already nearly free.** On
+constrained hardware this converts "I will find out in the post-mortem" into a live feed for
+approximately nothing.
+
+One caveat, which the rest of this section is about. Everything above concerns **delivery**, not
+**validity**. Cheap telemetry is not free of interpretation risk — and three of these
+near-free metrics were actively misleading until their nulls were measured. The one diagnostic
+that never lied is also the one that needs a real forward pass per layer.
+
+### 6.2 Head similarity had a null of ~0.97, not 0
 
 Max pairwise cosine between heads' attention matrices read 0.98 on layer 3 — apparently
 duplicate heads. It is not: **an untrained model reads 0.95–0.99 too.** Attention rows are
@@ -410,7 +482,7 @@ After the fix, layer 3's 0.98 survived (genuinely duplicated) while layers 4 and
 0.98 collapsed to 0.18 and 0.27 — untrained, not duplicated. **Every conclusion drawn from the
 uncentred metric had to be discarded.**
 
-### 6.2 The same failure one level up: latent-target pretraining
+### 6.3 The same failure one level up: latent-target pretraining
 
 We ran a data2vec/JEPA-style latent-prediction branch (EMA teacher, stop-gradient, narrow
 predictor, momentum 0.996→0.999) for 15,258 steps on 500M tokens. Every internal metric was
@@ -432,7 +504,7 @@ of internal metric was uninformative here: centred cosine rose 17×, effective r
 target std improved monotonically — and the downstream result was indistinguishable from the
 far simpler MLM line (§11).
 
-### 6.3 Zero-output layers poison run-level aggregates
+### 6.4 Zero-output layers poison run-level aggregates
 
 FFN-slack and attention-health tools reported `slack = 100%`, `util = 1.00`, `out_rank = nan`
 for a freshly grafted layer whose output projection is identically zero. Those rows entered the
@@ -440,7 +512,7 @@ run-level means and flipped an automated verdict to "OK" for several monitoring 
 health metric of the form *"how much of this layer's output matters"* is undefined when the
 output is zero by construction.
 
-### 6.4 The general lesson
+### 6.5 The general lesson
 
 **Every proxy metric needs its null measured on an untrained model of the same architecture,
 and its degenerate cases enumerated, before it is trusted once.** Ablation cost was the only
