@@ -3,7 +3,7 @@
 **A 28M-parameter encoder under a hard parameter cap: what two weeks of laptop-scale
 experiments established.**
 
-*osmansiddiquer · August 2026 · `benchtop-bert`*
+*Osman Siddique and Claude · August 2026 · `benchtop-bert`*
 
 > 📄 **The formal version is [`paper/report.pdf`](paper/report.pdf)** (LaTeX source
 > in [`paper/report.tex`](paper/report.tex)). This file is the same content in Markdown for
