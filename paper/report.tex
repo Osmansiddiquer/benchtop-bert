@@ -12,6 +12,7 @@
 \usepackage{enumitem}
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
+\usepackage{array}
 \usepackage{float}
 \usepackage{titlesec}
 
@@ -39,40 +40,49 @@ what two weeks of laptop-scale experiments established}
 
 \begin{abstract}
 \noindent
-We built a BERT-style encoder from scratch---attention, blocks, embeddings and MLM head, with
-only the tokenizer borrowed---and pretrained it on a single 4\,GB laptop GPU under a hard
-30M-parameter cap. The goal was to buy downstream accuracy with architecture and data
-interventions rather than parameters. Several components worked and are reported with
-controls: a staged data curriculum, replay mixing (with a corpus held at 0\% replay as the
-negative control, losing \nats{0.95} against \nats{0.25} for replayed corpora), span masking,
-and a two-phase procedure that installs an induction circuit into a masked language model,
-raising copy-from-context accuracy from 0.8\% to 93\%. The headline goal nonetheless failed:
-a \nats{0.435} (16\%) improvement in held-out MLM loss produced no measurable SST-2 gain,
-because at 872 dev examples the measurement instrument (SE $\approx$ 1.2\,pp) is coarser than
-every effect we produced.
+We pretrained a 28M-parameter BERT-style encoder from scratch---attention, blocks, embeddings
+and MLM head, only the tokenizer borrowed---on a single 4\,GB laptop GPU under a hard
+30M-parameter cap. \textbf{Five results transfer beyond this scale.}
 
-The principal technical contribution is a measured correction to the folklore on
-function-preserving layer grafting. Zero-initialised grafting is usually said to be exact only
-in pre-LN architectures. We show it is exact in \emph{post-LN} as well, under two conditions
-that are not usually stated: the block must be appended at the \emph{top} of the stack, and its
-LayerNorm affine parameters must be \emph{reset} to $(\gamma{=}1,\beta{=}0)$ rather than copied
-from the donor layer. Copying them costs \nats{{+}4.12}; resetting them costs
-\nats{0.000} (max $|\Delta\text{logit}| = 1.3\times10^{-3}$ against a mean logit magnitude of
-3.82). Inserting the same block mid-stack costs \nats{{+}0.23} regardless.
+\begin{enumerate}[leftmargin=1.4em,itemsep=4pt]
+\item \textbf{Zero-init layer grafting is exact in post-LN transformers}, not only in pre-LN as
+the folklore holds---provided the block is appended at the \emph{top} of the stack and its
+LayerNorm affines are \emph{reset} to $(\gamma{=}1,\beta{=}0)$ rather than copied from the
+donor. Copying them, which is what progressive stacking does, costs \textbf{\nats{{+}4.12}}.
+Resetting them costs \textbf{\nats{0.000}} ($\max|\Delta\text{logit}| = 1.3\times10^{-3}$
+against a mean logit of 3.82). Mid-stack insertion costs \nats{{+}0.23} however it is
+initialised. (\S\ref{sec:graft})
 
-A second contribution is methodological: a pattern for pulling \textbf{continuous
-internal-health telemetry off a live training run at approximately zero marginal GPU cost}
-(\S\ref{sec:zerocost})---atomic checkpoints so the run is readable from outside, scoring on the
-idle device (8.9--22.2\,s on CPU against 13.2--16.6 minutes of exclusive GPU for a downstream
-evaluation), and streaming the already-free per-layer signals straight into the training log.
+\item \textbf{A training run can be fully instrumented at $\approx$zero marginal GPU cost.}
+Atomic checkpoints make a live run readable from outside; the diagnostics then score on the
+\textbf{idle CPU in 8.9--22.2\,s} each, against \textbf{13.2--16.6 minutes of exclusive GPU} for
+a downstream evaluation. $\approx$100 readings per metric over 35 GPU-hours is what made trends
+legible where single readings were actively misleading. (\S\ref{sec:zerocost})
 
-We further show that a sixth layer at this scale has no work to do under three independent
-initialisations; that single-layer ablation cost over-attributes, with
-$\mathrm{marginal}(L_4\mid L_3) = -1.891$; that every correlational diagnostic we built
-misled at least once while causal ablation never did; that annealing corpus dominates
-annealing schedule by $11\times$; and that changing only the evaluation mixture moves reported
-validation loss by \nats{0.225}---over half the size of the project's entire pretraining
-progress. Total cost: 35.4 GPU-hours, $\approx$3.0B tokens processed.
+\item \textbf{Effective rank designed the architecture, and the prediction held.} FFN
+activations occupied 133--866 of 3{,}072 directions while residual-stream rank was \emph{still
+climbing} at the last layer; width was cut $3072 \to 1792$ and spent on depth; re-measuring the
+trained result gave $r_{99}/\dff \leq 0.56$, confirming width was still not the binding
+constraint. (\S\ref{sec:gotright})
+
+\item \textbf{Replay floor beats replay fraction.} 10\% replay retained as well as 35\%, while
+the one corpus dropped to 0\% lost \textbf{\nats{0.95}}---four times as much.
+(\S\ref{sec:worked})
+
+\item \textbf{MLM loss and downstream accuracy decoupled completely at this scale.} A
+\nats{-0.435} held-out improvement ($\approx$9$\times$ eval noise, unambiguously real) moved
+SST-2 by \textbf{0.0\,pp}. The spread across three very different pretraining regimes is
+\textbf{1.1\,SE}, and the two SST-2 harnesses disagree with each other by more than any
+intervention moved the number. (\S\ref{sec:scoreboard})
+\end{enumerate}
+
+\noindent
+Also reported: a sixth layer with no work to do under three independent initialisations; a
+\emph{negative} pairwise ablation marginal---removing a useless layer halves the measured cost
+of removing a useful one; an induction circuit installed into a masked LM, taking
+copy-from-context from 0.8\% to 93\% in 6.5 minutes; span masking that improved the harder task
+more than the easier one; and an 11$\times$ effect of annealing \emph{corpus} over annealing
+\emph{schedule}. Total cost: \textbf{35.4 GPU-hours}, $\approx$3.0B tokens processed.
 \end{abstract}
 
 \tableofcontents
@@ -84,27 +94,47 @@ progress. Total cost: 35.4 GPU-hours, $\approx$3.0B tokens processed.
 The constraint that shaped this project was a hard cap of 30M parameters, on a single RTX
 3050 Ti Laptop GPU with 4\,GB of VRAM. Under such a cap the interesting question is not
 \emph{how well can this do}---the answer is known to be ``worse than BERT-base''---but
-\emph{how much of the gap can be closed by spending the budget better}. We attacked that
-question with architecture surgery (structured pruning, layer grafting, depth reallocation),
-data curriculum design, masking-scheme changes, an alternative pretraining objective, and a
-battery of diagnostic tooling.
+\emph{how much of the gap can be closed by spending the budget better}.
 
-This report is organised around what the experiments actually established rather than around
-the chronology. Section~\ref{sec:setup} gives the setup and the evaluation protocol, which
-turned out to matter more than most of the interventions. Section~\ref{sec:worked} reports the
+The answer turned out to be ``almost none of it'' (\S\ref{sec:scoreboard}), and the durable
+output is therefore not the model but \textbf{the instruments built to interrogate it}. Every
+result in this report comes from one of these, and each is a standalone script.
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\newcommand{\rr}[1]{\raggedright\arraybackslash #1}%
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.19\textwidth}>{\raggedright\arraybackslash}p{0.35\textwidth}>{\raggedright\arraybackslash}p{0.38\textwidth}}
+\toprule
+tool & what it measures & what it established \\
+\midrule
+\texttt{graft\_ladder.py} & whether a layer graft preserves the function, at the logit level & \S\ref{sec:graft} --- reset the donor's LN affines: $+4.12 \to 0.000$ nats \\
+\texttt{layer\_contrib.py} & \textbf{causal} ablation cost per layer, single and pairwise & \S\ref{sec:depth} --- layer 4 worth 0.073 vs layer 5's 0.963; $\mathrm{marginal}(4|3) = -1.891$ \\
+\texttt{ffn\_rank.py} & activation and weight spectra, effective rank, $r@90/99\%$ & \S\ref{sec:gotright} --- \dff{} 3.5$\times$ oversized $\Rightarrow$ the entire v2 architecture \\
+\texttt{dead\_neuron\_\allowbreak check.py} & per-unit firing rates over 2.0M tokens & 2{,}697/3{,}072 layer-0 units dead $\Rightarrow$ GELU swap, and prune scored under GELU \\
+\texttt{attn\_health.py} & per-head entropy / contribution, out\_rank, \textbf{centred} head similarity & \S\ref{sec:diag} --- the raw metric's null is 0.97, not 0 \\
+\texttt{ffn\_slack.py} & slack, never-positive fraction, utilisation, kurtosis & live per-layer health; separates dead-zone mass from real width pressure \\
+\texttt{span\_eval.py} & fixed-protocol held-out MLM loss, both masking schemes & the only cross-run comparable numbers in the repo (\S\ref{sec:protocol}) \\
+\texttt{audit\_eval.py} & train/val overlap, duplicate blocks, averaging bias & \S\ref{sec:evalvalid} --- found a genuinely contaminated corpus \\
+\texttt{masking\_\allowbreak difficulty.py} & scattered vs span difficulty offsets on one model & \nats{{+}1.74} --- the train/eval gap that looks like a bug and is not \\
+\bottomrule
+\end{tabular}
+\caption{The toolkit. All but the first two run on the \textbf{CPU in under 25 seconds}
+(\S\ref{sec:zerocost}), so they can be run against a live training job on a loop without
+costing it anything.}
+\end{table}
+
+This report is organised around what the experiments established rather than around the
+chronology. Section~\ref{sec:setup} gives the setup and the evaluation protocol, which turned
+out to matter more than most of the interventions. Section~\ref{sec:worked} reports the
 components that demonstrably worked, with controls. Section~\ref{sec:graft} is the main
-technical contribution: a measured, corrected recipe for function-preserving layer grafting in
-post-LN transformers. Section~\ref{sec:depth} reports the depth result, and
-Section~\ref{sec:diag} the diagnostics---both the zero-cost telemetry pattern that made the
-project observable at all (\S\ref{sec:zerocost}) and the ways the cheap metrics misled.
-Sections~\ref{sec:anneal}--\ref{sec:width} report the remaining results. Section~\ref{sec:eng} collects engineering findings that cost real time.
-Section~\ref{sec:scoreboard} presents the final scoreboard and the project's central negative
-result. Section~\ref{sec:lessons} states what we would do differently.
+technical contribution. Section~\ref{sec:depth} reports the depth result, and
+Section~\ref{sec:diag} the diagnostics. Sections~\ref{sec:anneal}--\ref{sec:width} report the
+remaining results, Section~\ref{sec:eng} the engineering findings, and
+Section~\ref{sec:scoreboard} the scoreboard and the central negative result.
 
-Full checkpoint lineage, per-run configuration and the chronological build log are in the
-repository (\texttt{checkpoints/HISTORY.md}, \texttt{WORKLOG.md}).
+Full checkpoint lineage and the chronological build log are in the repository, in
+\texttt{checkpoints/}\allowbreak\texttt{HISTORY.md} and \texttt{WORKLOG.md} respectively.
 
-%======================================================================
 \section{Setup}\label{sec:setup}
 
 \subsection{Model}
@@ -606,11 +636,70 @@ nearly free. On constrained hardware this turns ``I will find out in the post-mo
 live feed, for approximately nothing.
 
 One caveat, which the rest of this section is about: everything above concerns \textbf{delivery},
-not \textbf{validity}. Cheap telemetry is not free of interpretation risk, and three of these
-near-free metrics were actively misleading until their nulls were measured. The one diagnostic
-that never lied is also the one that needs a real forward pass per layer.
+not \textbf{validity}. These metrics earned their keep---effective rank designed the v2
+architecture and dead-unit counting corrected how it was pruned
+(\S\ref{sec:gotright})---but each needed calibrating first, and three of them gave confidently
+wrong readings until their nulls and degenerate cases were audited.
 
-\subsection{Head similarity had a null of $\approx$0.97, not 0}
+\subsection{What the cheap metrics got right}\label{sec:gotright}
+
+Before the failures, the record: these tools were mostly right, and they were load-bearing. The
+entire v2 architecture was designed from correlational readings, and the readings held up.
+
+\paragraph{Effective rank designed the model.} \texttt{ffn\_rank.py} measured the spectrum of
+FFN activations and of the residual stream on \texttt{ckpt3}, and the two readings pointed in
+opposite directions---which is exactly what made them actionable:
+
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+& reading & conclusion \\
+\midrule
+FFN activations, $r@99\%$ & 133 / 834 / 744 / 866 of \textbf{3{,}072} & width is 3.5$\times$ oversized \\
+residual stream, eff.\ rank & $149 \to 269 \to 483 \to \mathbf{523}$ of 768, still climbing & depth has headroom \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Width was cut $3072 \to 1792$ and the savings spent on depth. The check afterwards closed the
+loop: re-measuring the trained v2 gave $r_{99}/\dff \leq 0.56$ on every layer---width was
+\emph{still} not the binding constraint even at 1792, so the cut was safe rather than merely
+survivable. Predicted, acted, verified. That is the strongest endorsement a correlational
+metric can get, and this one earned it.
+
+\paragraph{Dead-unit counting changed how the prune was scored.}
+\texttt{dead\_neuron\_check.py} found 2{,}697 of 3{,}072 layer-0 units that never fired once
+over 2.0M tokens under ReLU. That motivated the GELU swap---but the more valuable consequence
+was procedural: pruning importances were then scored \emph{under GELU rather than ReLU}, which
+kept 1{,}501 of layer 0's 2{,}755 ReLU-dead units (96.2\% of the retained importance mass).
+Scoring under the wrong activation would have discarded exactly the capacity the activation
+swap existed to recover.
+
+The same tool taught the sample-size lesson: at 8{,}192 tokens layer 0 read 2{,}795 dead; at
+2.0M tokens it read 2{,}697, with explicit $<$1/100k and $<$1/10k columns separating genuinely
+dead units from rare-token detectors. Pruning the latter removes memory, not redundancy.
+
+\paragraph{Ablation cost settled a question three other metrics could not.}
+\texttt{layer\_contrib.py} is the causal one, and it worked: slack, effective rank and head
+similarity had all pointed at layer 4 ambiguously, and ablation gave a number---\nats{{+}0.073}
+against layer 5's 0.963---that survived three initialisations and 40+ readings
+(\S\ref{sec:depth}).
+
+\paragraph{Head similarity worked once centred.} After the fix, layer 3 still read 0.95 and
+\emph{was} genuinely a duplicated pair, while layers 4 and 5 fell to 0.13 and 0.33---correctly
+reclassified from ``duplicated'' to ``untrained''. The metric was recovered, not discarded.
+
+\paragraph{FFN slack learned to distinguish its own two causes.} It now annotates layers
+\texttt{!} (bimodal dead-zone mass---units parked below the activation threshold) versus
+\texttt{*} (genuinely dense, a real width-pressure candidate). The same number, two opposite
+meanings; the tool reports which.
+
+So the honest summary is not that these metrics lie. It is that each needed \textbf{a null and
+a degenerate-case audit} before its readings meant anything---and that even fully calibrated,
+they answer a different question than ablation does. The next three subsections are what that
+cost when we skipped it.
+
+\subsection{An unmeasured null: head similarity read $\approx$0.97 at random init}
 
 The maximum pairwise cosine between heads' attention matrices read 0.98 on layer 3, apparently
 indicating duplicate heads. It does not: \textbf{an untrained model reads 0.95--0.99 as well.}
@@ -631,7 +720,7 @@ After the fix, layer 3's 0.98 survived (genuinely duplicated) while layers 4 and
 0.98 collapsed to 0.18 and 0.27---they were untrained, not duplicated. Every conclusion drawn
 from the uncentred metric had to be discarded.
 
-\subsection{The same failure one level up: latent-target pretraining}
+\subsection{The same failure one level up: latent-target pretraining}\label{sec:jepa}
 
 We ran a data2vec/JEPA-style latent-prediction branch (EMA teacher, stop-gradient, narrow
 predictor, momentum $0.996 \to 0.999$) for 15{,}258 steps on 500M tokens. Every internal metric
@@ -659,7 +748,7 @@ class} of internal metric was uninformative here: centred cosine rose $17\times$
 rank held steady, target standard deviation improved monotonically---and the downstream result
 was indistinguishable from the far simpler MLM line (\S\ref{sec:scoreboard}).
 
-\subsection{Zero-output layers poison run-level aggregates}
+\subsection{A degenerate case: zero-output layers poison run-level aggregates}
 
 FFN-slack and attention-health tools reported \texttt{slack = 100\%}, \texttt{util = 1.00},
 \texttt{out\_rank = nan} for a freshly grafted layer whose output projection is identically
@@ -671,10 +760,22 @@ and exclude that case rather than average it in.
 \subsection{The general lesson}
 
 \textbf{Every proxy metric needs its null measured on an untrained model of the same
-architecture, and its degenerate cases enumerated, before it is trusted once.} Ablation cost
-was the only diagnostic we never had to retract, because it is defined by an intervention on
-the model rather than by a statistic of its activations. It is also $\approx$40$\times$ more
-expensive per reading. That trade was worth it.
+architecture, and its degenerate cases enumerated, before it is trusted once.} That is a
+calibration cost, not a verdict: once paid, effective rank designed a working architecture,
+dead-unit counting corrected the pruning procedure, and centred head similarity separated
+duplicated heads from untrained ones. Every one of these was cheap, and every one earned its
+place.
+
+What survives as a genuine limitation is narrower and more interesting. Ablation cost is the
+only diagnostic we never had to retract, because it is defined by an \emph{intervention} on the
+model rather than by a statistic of its activations---and it is $\approx$40$\times$ more
+expensive per reading. Everything cheap is a proxy for ``is this layer doing something'', and a
+proxy can be perfectly calibrated and still answer a different question than ``what happens if
+I remove it''. \S\ref{sec:jepa} is the extreme case: metrics that were correctly read,
+monotonically improving, and predicted nothing about the outcome we cared about.
+
+Use the cheap metrics continuously to see \emph{what the model is doing}; use ablation sparingly
+to find out \emph{what it is worth}. They are not competing instruments.
 
 %======================================================================
 \section{Annealing: corpus dominates schedule}\label{sec:anneal}

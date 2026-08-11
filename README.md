@@ -21,6 +21,24 @@ GELU. **SST-2 dev 85–86%** (BERT-base ≈ 92.7% at 110M params). Total cost: *
 
 ---
 
+## The toolkit
+
+The durable output of this project is not the model — it is the instruments built to
+interrogate it. All but the first two run **on the CPU in under 25 seconds**, against a live
+training job, on a loop, without costing it anything.
+
+| tool | what it measures | what it established |
+|---|---|---|
+| `graft_ladder.py` | whether a layer graft preserves the function, at the logit level | reset the donor's LN affines: **+4.12 → 0.000 nats** |
+| `layer_contrib.py` | **causal** ablation cost per layer, single and pairwise | layer 4 worth 0.073 vs layer 5's 0.963; `marginal(4\|3) = −1.891` |
+| `ffn_rank.py` | activation and weight spectra, effective rank | `d_ff` 3.5× oversized ⇒ the entire v2 architecture |
+| `dead_neuron_check.py` | per-unit firing rates over 2.0M tokens | 2,697/3,072 layer-0 units dead ⇒ GELU swap, prune scored under GELU |
+| `attn_health.py` | per-head entropy / contribution, **centred** head similarity | the raw metric's null is 0.97, not 0 |
+| `ffn_slack.py` | slack, never-positive fraction, utilisation | live per-layer health; dead-zone mass vs real width pressure |
+| `span_eval.py` | fixed-protocol held-out MLM loss, both maskings | the only cross-run comparable numbers here |
+| `audit_eval.py` | train/val overlap, duplicate blocks, averaging bias | found a genuinely contaminated corpus |
+| `masking_difficulty.py` | scattered vs span offsets on one fixed model | +1.74 nats — the train/eval gap that looks like a bug and isn't |
+
 ## What we set out to do, and what happened
 
 **Goal:** buy downstream accuracy with architecture and data interventions rather than
@@ -82,12 +100,14 @@ Each is measured, not asserted; §-numbers point into the report.
   useless layer 4 *halves* the apparent cost of removing layer 3, because layer 3's damage was
   being amplified downstream rather than absorbed. Use pairwise marginals for pruning
   decisions. §5.3
-- **Every correlational diagnostic we built lied at least once; causal ablation never did.**
-  Head similarity had a null of **~0.97, not 0** (untrained heads sit near-uniform and are
-  therefore trivially similar) — it could not distinguish the two cases it existed to
-  separate. A JEPA branch improved every internal metric monotonically for 15,258 steps and
-  gained nothing downstream. **Measure a metric's null on an untrained model before trusting
-  it once.** §6
+- **Cheap correlational metrics designed the architecture — after they were calibrated.**
+  Effective rank is the win: FFN activations needed only 133–866 of 3,072 directions while
+  residual-stream rank was *still climbing* at the last layer, so width was cut and depth
+  bought; re-measuring the trained result gave `r99/d_ff ≤ 0.56`, confirming the cut was safe.
+  Dead-unit counting (2,697/3,072 layer-0 units never fired) changed *how* the prune was
+  scored. But each metric needed its null and degenerate cases audited first: head similarity
+  reads **~0.97 at random init**, not 0. **Measure a metric's null on an untrained model before
+  trusting one reading.** §6.2–6.3
 - **In annealing, corpus register dominates schedule by 11×.** Identical LR, seed, schedule and
   parent checkpoint; TinyStories vs Cosmopedia. TinyStories produced the project's *lowest*
   val loss (0.9989) and was pure artefact — its deliberate ~1,500-word vocabulary narrows the
